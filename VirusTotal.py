@@ -1,3 +1,13 @@
+# Modification of the module is allowed only if the license is retained.
+# MMP""MM""YMM `7MMF'   `7MF' `7MM"""Mq.  7MM"""YMM
+# P'   MM   `7   `MA     ,V     MM   `MM.  MM    7
+#     MM         VM:   ,V      MM   ,M9   MM   d
+#     MM          MM.  M'      MMmmdM9    MMmmMM
+#     MM          `MM A'       MM         MM   Y  ,
+#     MM           :MM;        MM         MM     ,M
+#   .JMML.          VF       .JMML.     .JMMmmmmMMM
+#                  ,M
+# This module is licensed and fully copyrighted by Type, copyright is allowed while maintaining the author's mention in the code.
 # meta developer: @TypeModules
 
 from .. import loader, utils
