@@ -29,13 +29,19 @@ class GitMod(loader.Module):
                 "ru",
                 "Language (en, ru, uk)",
                 validator=loader.validators.Choice(["en", "ru", "uk"]),
-            )
+            ),
+            loader.ConfigValue(
+                "api_key",
+                None,
+                "GitHub API Key (Personal Access Token). Increases rate limits.",
+                validator=loader.validators.Hidden(loader.validators.String()),
+            ),
         )
 
     LOCALES = {
         "en": {
             "repo_not_found": "❌ <b>Repository not found.</b> Check the username/repo name.",
-            "api_error": "❌ <b>GitHub API Error.</b> Try again later.",
+            "api_error": "❌ <b>GitHub API Error.</b> Try again later or check API Key.",
             "info_header": "🐙 <b>GitHub Info:</b> <code>{}</code>\n",
             "stars": "⭐ <b>Stars:</b>",
             "forks": "🍴 <b>Forks:</b>",
@@ -59,7 +65,7 @@ class GitMod(loader.Module):
         },
         "ru": {
             "repo_not_found": "❌ <b>Репозиторий не найден.</b> Проверьте имя пользователя/репозитория.",
-            "api_error": "❌ <b>Ошибка GitHub API.</b> Попробуйте позже.",
+            "api_error": "❌ <b>Ошибка GitHub API.</b> Попробуйте позже или проверьте API ключ.",
             "info_header": "🐙 <b>GitHub Инфо:</b> <code>{}</code>\n",
             "stars": "⭐ <b>Звезды:</b>",
             "forks": "🍴 <b>Форки:</b>",
@@ -83,7 +89,7 @@ class GitMod(loader.Module):
         },
         "uk": {
             "repo_not_found": "❌ <b>Репозиторій не знайдено.</b> Перевірте ім'я користувача/репозиторія.",
-            "api_error": "❌ <b>Помилка GitHub API.</b> Спробуйте пізніше.",
+            "api_error": "❌ <b>Помилка GitHub API.</b> Спробуйте пізніше або перевірте API ключ.",
             "info_header": "🐙 <b>GitHub Інфо:</b> <code>{}</code>\n",
             "stars": "⭐ <b>Зірки:</b>",
             "forks": "🍴 <b>Форки:</b>",
@@ -115,9 +121,18 @@ class GitMod(loader.Module):
         return self.LOCALES.get(lang, self.LOCALES["en"]).get(key, key)
 
     async def _fetch_data(self, url):
+        headers = {
+            "User-Agent": "Hikka-Userbot",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        
+        if self.config["api_key"]:
+            headers["Authorization"] = f"Bearer {self.config['api_key']}"
+
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers={"User-Agent": "Hikka-Userbot"}) as resp:
+                async with session.get(url, headers=headers) as resp:
                     if resp.status == 404:
                         return None
                     if resp.status != 200:
