@@ -51,6 +51,30 @@ class EasyPayMod(loader.Module):
                 "Ваш адрес кошелька TON для Tonkeeper.",
                 validator=loader.validators.String(),
             ),
+            loader.ConfigValue(
+                "show_card",
+                True,
+                "Показывать кнопку оплаты картой.",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "show_phone",
+                True,
+                "Показывать кнопку оплаты по номеру телефона.",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "show_cryptobot",
+                True,
+                "Показывать кнопку оплаты CryptoBot.",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "show_ton",
+                True,
+                "Показывать кнопку оплаты Tonkeeper.",
+                validator=loader.validators.Boolean(),
+            ),
         )
 
     async def client_ready(self, client, db):
@@ -133,6 +157,12 @@ class EasyPayMod(loader.Module):
             phone = self.config["bank_phone"] or "Не установлено"
             await call.answer(f"📱 Номер телефона:\n{phone}", show_alert=True)
 
+        async def back_handler(call):
+            await call.edit(
+                text=main_text,
+                reply_markup=main_markup
+            )
+
         async def cryptobot_handler(call):
             if not self.config["cryptobot_token"]:
                 await call.answer("❌ Токен CryptoBot не настроен.", show_alert=True)
@@ -177,12 +207,6 @@ class EasyPayMod(loader.Module):
                 ]
             )
 
-        async def back_handler(call):
-            await call.edit(
-                text=main_text,
-                reply_markup=main_markup
-            )
-
         # Main Menu Construction
         main_text = (
             f"<b>💸 Счет на оплату</b>\n\n"
@@ -191,18 +215,28 @@ class EasyPayMod(loader.Module):
             f"👇 <b>Выберите способ оплаты:</b>"
         )
         
-        main_markup = [
-            [
-                {"text": "💳 Карта", "callback": card_handler},
-                {"text": "📱 Телефон", "callback": phone_handler},
-            ],
-            [
-                {"text": f"🤖 CryptoBot (~{rates['USD']} $)", "callback": cryptobot_handler},
-            ],
-            [
-                {"text": f"💎 Tonkeeper (~{rates['TON']} TON)", "callback": ton_handler},
-            ]
-        ]
+        main_markup = []
+        
+        # Row 1: Card and Phone
+        row_1 = []
+        if self.config["show_card"]:
+            row_1.append({"text": "💳 Карта", "callback": card_handler})
+        if self.config["show_phone"]:
+            row_1.append({"text": "📱 Телефон", "callback": phone_handler})
+        if row_1:
+            main_markup.append(row_1)
+            
+        # Row 2: CryptoBot
+        if self.config["show_cryptobot"]:
+            main_markup.append([{"text": f"🤖 CryptoBot (~{rates['USD']} $)", "callback": cryptobot_handler}])
+            
+        # Row 3: Tonkeeper
+        if self.config["show_ton"]:
+            main_markup.append([{"text": f"💎 Tonkeeper (~{rates['TON']} TON)", "callback": ton_handler}])
+
+        if not main_markup:
+            await utils.answer(message, "❌ <b>Нет доступных способов оплаты (все скрыты в настройках).</b>")
+            return
 
         # Determine who can access the buttons
         allowed_users = [message.sender_id]
