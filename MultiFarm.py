@@ -19,7 +19,11 @@ import time
 import json
 from telethon import TelegramClient, functions, types
 from telethon.sessions import StringSession, SQLiteSession
-from telethon.errors import FloodWaitError, UserNotParticipantError, ChannelPrivateError, SessionPasswordNeededError
+from telethon.errors import (
+    FloodWaitError, UserNotParticipantError, ChannelPrivateError, 
+    SessionPasswordNeededError, InviteHashExpiredError, InviteHashInvalidError,
+    UserAlreadyParticipantError, MessageIdInvalidError
+)
 from .. import loader, utils
 
 try:
@@ -62,24 +66,61 @@ class MultiFarmMod(loader.Module):
             # Spam settings
             loader.ConfigValue("spam_mode", False, "Включить режим рассылки", validator=loader.validators.Boolean()),
             loader.ConfigValue("spam_interval", "1h", "Интервал для рассылки (e.g., '30m')"),
-            loader.ConfigValue("target_chat", None, "ID, @username, ссылка на чат или ПАПКУ для рассылки"),
-            loader.ConfigValue("message", "Hello!", "Сообщение для рассылки"),
+            loader.ConfigValue("target_chat", None, "ID, @username, ссылка на чат. Можно несколько через запятую."),
+            loader.ConfigValue("message", "Hello!", "Сообщение для рассылки (поддерживает spintax {a|b|c})"),
             # AI settings
             loader.ConfigValue("gemini_api_key", None, "Gemini API Key for AI control", validator=loader.validators.Hidden()),
-            loader.ConfigValue("gemini_prompt", "Analyze this MultiFarm module config. Suggest changes to optimize farming and spam. Respond ONLY with a JSON object of config keys and their new values.", "Prompt for Gemini AI"),
+            loader.ConfigValue("gemini_model", "gemini-2.5-pro", "Модель Gemini для использования", validator=loader.validators.String()),
+            loader.ConfigValue("gemini_prompt", "Analyze this MultiFarm config for optimal farming/spam. Key rules: 1. Respect bot cooldowns (Iris ~4h, Funstat ~1h) - don't set intervals lower. 2. IGNORE and DO NOT CHANGE text fields like 'message', 'funstat_spam_message', or any IDs. 3. Respond ONLY with a JSON object of keys and their new values.", "Prompt for Gemini AI"),
             loader.ConfigValue("admin_id", None, "User ID админа для уведомлений от ИИ", validator=loader.validators.Integer(minimum=1)),
             # Technical settings
             loader.ConfigValue("api_id", 0, "API ID (0 - по умолчанию)"),
             loader.ConfigValue("api_hash", "", "API HASH", validator=loader.validators.Hidden()),
+            loader.ConfigValue("concurrency_limit", 10, "Макс. кол-во одновременных задач для аккаунтов", validator=loader.validators.Integer(minimum=1)),
         )
         self.active_clients = {}
         self.pending_login = {}
         self.task_loop_task = None
+        self.semaphore = None
 
     async def client_ready(self, client, db):
         self.client = client
         self.db = db
+        self.semaphore = asyncio.Semaphore(self.config["concurrency_limit"])
+        
+        stats = self.db.get("MultiFarm", "stats", {})
+        if "start_time" not in stats:
+            stats["start_time"] = time.time()
+            self.db.set("MultiFarm", "stats", stats)
+
         self.task_loop_task = asyncio.create_task(self.task_scheduler())
+
+    async def on_unload(self):
+        if self.task_loop_task:
+            self.task_loop_task.cancel()
+        for client in self.active_clients.values():
+            if client.is_connected():
+                await client.disconnect()
+        self.active_clients.clear()
+
+    def _inc_stat(self, key, value=1):
+        stats = self.db.get("MultiFarm", "stats", {})
+        stats[key] = stats.get(key, 0) + value
+        self.db.set("MultiFarm", "stats", stats)
+
+    async def semaphore_wrapper(self, func, *args, **kwargs):
+        async with self.semaphore:
+            return await func(*args, **kwargs)
+    
+    def _spin(self, text):
+        pattern = re.compile(r'{([^{}]*)}')
+        while True:
+            match = pattern.search(text)
+            if not match:
+                break
+            options = match.group(1).split('|')
+            text = text.replace(match.group(0), random.choice(options), 1)
+        return text
 
     def _parse_time(self, time_str):
         if not time_str: return 0
@@ -93,8 +134,44 @@ class MultiFarmMod(loader.Module):
             elif unit == 'd': total_seconds += value * 86400
         return total_seconds
 
+    async def _run_account_tasks(self, phone, session_str):
+        try:
+            now = int(time.time())
+            last_runs = self.db.get("MultiFarm", "last_runs", {})
+            if phone not in last_runs: last_runs[phone] = {}
+
+            client = await self._get_client(phone, session_str)
+            if not client: return
+
+            funstat_cd = self._parse_time(self.config['funstat_interval'])
+            if self.config["farm_funstat"] and now - last_runs[phone].get("funstat", 0) > funstat_cd:
+                await self._farm_funstat(client, phone)
+                last_runs[phone]["funstat"] = now
+                self.db.set("MultiFarm", "last_runs", last_runs)
+                await asyncio.sleep(random.uniform(1, 3))
+
+            iris_cd = self._parse_time(self.config['iris_interval'])
+            if self.config["farm_iris"] and now - last_runs[phone].get("iris", 0) > iris_cd:
+                await self._farm_iris(client, phone)
+                last_runs[phone]["iris"] = now
+                self.db.set("MultiFarm", "last_runs", last_runs)
+                await asyncio.sleep(random.uniform(1, 3))
+
+            spam_cd = self._parse_time(self.config['spam_interval'])
+            if self.config["spam_mode"] and now - last_runs[phone].get("spam", 0) > spam_cd:
+                await self._do_spam(client, phone)
+                last_runs[phone]["spam"] = now
+                self.db.set("MultiFarm", "last_runs", last_runs)
+                await asyncio.sleep(random.uniform(1, 3))
+
+        except FloodWaitError as e:
+            logger.warning(f"Flood wait for {phone}: {e.seconds}s")
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            logger.error(f"Scheduler error for account {phone}: {e}", exc_info=False)
+
     async def task_scheduler(self):
-        await asyncio.sleep(10)
+        await asyncio.sleep(15)
         while True:
             if not self.config["status"]:
                 await asyncio.sleep(60)
@@ -105,47 +182,10 @@ class MultiFarmMod(loader.Module):
                 await asyncio.sleep(60)
                 continue
 
-            last_runs = self.db.get("MultiFarm", "last_runs", {})
+            tasks = [self.semaphore_wrapper(self._run_account_tasks, phone, session) for phone, session in accounts.items()]
+            await asyncio.gather(*tasks)
             
-            for phone, session_str in list(accounts.items()):
-                now = int(time.time())
-                if phone not in last_runs: last_runs[phone] = {}
-
-                client = await self._get_client(phone, session_str)
-                if not client: continue
-                
-                try:
-                    # FunStat Farm
-                    funstat_cd = self._parse_time(self.config['funstat_interval'])
-                    if self.config["farm_funstat"] and now - last_runs[phone].get("funstat", 0) > funstat_cd:
-                        await self._farm_funstat(client, phone)
-                        last_runs[phone]["funstat"] = now
-                        self.db.set("MultiFarm", "last_runs", last_runs)
-                        await asyncio.sleep(random.randint(5, 10))
-
-                    # Iris Farm
-                    iris_cd = self._parse_time(self.config['iris_interval'])
-                    if self.config["farm_iris"] and now - last_runs[phone].get("iris", 0) > iris_cd:
-                        await self._farm_iris(client, phone)
-                        last_runs[phone]["iris"] = now
-                        self.db.set("MultiFarm", "last_runs", last_runs)
-                        await asyncio.sleep(random.randint(5, 10))
-
-                    # Spam Mode
-                    spam_cd = self._parse_time(self.config['spam_interval'])
-                    if self.config["spam_mode"] and now - last_runs[phone].get("spam", 0) > spam_cd:
-                       await self._do_spam(client, phone)
-                       last_runs[phone]["spam"] = now
-                       self.db.set("MultiFarm", "last_runs", last_runs)
-                       await asyncio.sleep(random.randint(5, 10))
-
-                except FloodWaitError as e:
-                    logger.warning(f"Flood wait for {phone}: {e.seconds}s")
-                    await asyncio.sleep(e.seconds)
-                except Exception as e:
-                    logger.error(f"Scheduler error from {phone}: {e}", exc_info=True)
-            
-            await asyncio.sleep(30) # Main scheduler check interval
+            await asyncio.sleep(60)
 
     async def _ensure_bot_started(self, client, phone, bot_name, start_link):
         initialized = self.db.get("MultiFarm", "initialized_bots", {})
@@ -167,80 +207,143 @@ class MultiFarmMod(loader.Module):
             return False
 
     async def _farm_funstat(self, client, phone):
-        start_link = "https://funstat.info/?start=010125DE6DEA01000000"
-        if not await self._ensure_bot_started(client, phone, "funstat", start_link): return
-        
+        await self._ensure_bot_started(client, phone, "funstat", "https://funstat.info/?start=010125DE6DEA01000000")
         target = self.config["target_chat"] if self.config["target_chat"] else "@flood"
         message = self.config["funstat_spam_message"]
         if "@funstatbot" not in message: message += " @funstatbot"
         
         await client.send_message(target, message)
+        self._inc_stat("funstat_farm_count")
         logger.info(f"Farming FunStat with {phone} in {target}")
 
     async def _farm_iris(self, client, phone):
         await client.send_message("@iris_cm_bot", "фарма")
+        self._inc_stat("iris_farm_count")
         logger.info(f"Farming Iris with {phone}")
 
+    async def _send_spam_to_target(self, client, phone, entity, message_template):
+        try:
+            try:
+                await client(functions.channels.JoinChannelRequest(entity))
+                await asyncio.sleep(random.uniform(2, 4))
+            except UserAlreadyParticipantError:
+                pass 
+            except Exception as e_join:
+                logger.error(f"Failed to join {getattr(entity, 'title', entity.id)} for {phone}: {e_join}")
+                self._inc_stat("spam_errors")
+                return
+
+            async with client.action(entity, 'typing'):
+                await asyncio.sleep(random.uniform(1.5, 3.5))
+                spun_message = self._spin(message_template)
+                await client.send_message(entity, spun_message)
+                self._inc_stat("spam_success")
+                logger.info(f"Spam from {phone} to {getattr(entity, 'title', entity.id)}")
+        except Exception as e_send:
+            self._inc_stat("spam_errors")
+            logger.error(f"Spam error from {phone} to {getattr(entity, 'title', entity.id)}: {e_send}")
+
     async def _do_spam(self, client, phone, custom_message: str = None):
-        target = self.config['target_chat']
-        if not target: return
+        target_config = self.config['target_chat']
+        if not target_config: return
 
         message_to_send = custom_message or self.config["message"]
         
         targets = []
-        if "t.me/addlist/" in target:
-            folder_hash = target.split('/')[-1]
-            target_folder = None
-            
+        chat_list = [chat.strip() for chat in target_config.split(',') if chat.strip()]
+        for chat_identifier in chat_list:
             try:
-                await client(functions.messages.ImportChatlistInviteRequest(slug=folder_hash))
-                logger.info(f"Join folder request sent for {phone}")
-            except Exception as e:
-                logger.warning(f"Could not join folder for {phone} (maybe already joined?): {e}")
-
-            # Даем время на синхронизацию
-            await asyncio.sleep(3)
-            
-            all_folders_obj = await client(functions.messages.GetDialogFiltersRequest())
-            for folder in all_folders_obj: # ИСПРАВЛЕНА ЭТА СТРОКА
-                if isinstance(folder, types.DialogFilter) and getattr(folder, 'slug', None) == folder_hash:
-                    target_folder = folder
-                    break
-
-            if not target_folder:
-                logger.error(f"FATAL: Could not find folder with slug {folder_hash} for account {phone}.")
-                return
-
-            try:
-                dialogs = await client.get_dialogs(folder=target_folder.id)
-                chats_in_folder = [d.entity for d in dialogs if d.is_channel or d.is_group]
-                
-                if not chats_in_folder:
-                    logger.warning(f"Folder '{getattr(target_folder, 'title', 'N/A')}' for {phone} is empty.")
+                if 'joinchat/' in chat_identifier or '/+' in chat_identifier:
+                    invite_hash = chat_identifier.split('/')[-1].replace('+', '')
+                    updates = await client(functions.messages.ImportChatInviteRequest(invite_hash))
+                    entity = next((chat for chat in updates.chats), None)
+                    if entity: targets.append(entity)
                 else:
-                    targets.extend(chats_in_folder)
-            except Exception as e:
-                logger.error(f"Could not get dialogs from folder for {phone}: {e}")
-                return
-        else:
-            try:
-                targets.append(await client.get_entity(target))
-            except (ValueError, ChannelPrivateError):
-                 logger.error(f"Invalid target chat for spam: {target}")
-                 return
+                    targets.append(await client.get_entity(chat_identifier))
+            except UserAlreadyParticipantError:
+                try: targets.append(await client.get_entity(chat_identifier))
+                except Exception: pass
+            except Exception:
+                logger.error(f"Could not process target '{chat_identifier}' for {phone}")
+
+        if not targets:
+            return
+
+        tasks = [self._send_spam_to_target(client, phone, entity, message_to_send) for entity in targets]
+        await asyncio.gather(*tasks)
+
+    @loader.command(ru_doc="<инвайт-ссылка> <ссылка> - Пожаловаться (BETA)")
+    async def mf_report(self, message):
+        args = utils.get_args_raw(message).split()
+        if len(args) != 2:
+            return await utils.answer(message, "<b>❌ Неверный формат.</b>\nНужно: <code>.mf_report &lt;инвайт-ссылка&gt; &lt;ссылка на сообщение&gt;</code>")
         
-        for entity in targets:
+        invite_link, msg_link = args
+        
+        match = re.search(r"t\.me/(c/)?([\w\d_]+)/(\d+)", msg_link)
+        if not match:
+            return await utils.answer(message, "<b>❌ Неверный формат ссылки на сообщение.</b>")
+
+        message_id = int(match.group(3))
+        
+        if 'joinchat/' in invite_link or '/+' in invite_link:
+            invite_hash = invite_link.split('/')[-1].replace('+', '')
+        else:
+            return await utils.answer(message, "<b>❌ Первая ссылка должна быть инвайт-ссылкой (<code>t.me/+...</code> или <code>t.me/joinchat/...</code>).</b>")
+
+        accounts = self.db.get("MultiFarm", "accounts", {})
+        if not accounts:
+            return await utils.answer(message, "🚫 <b>Нет аккаунтов для отправки жалоб.</b>")
+
+        msg = await utils.answer(message, f"<b>🔥 Начинаю рейд на сообщение...</b>\n<b>Аккаунтов в работе:</b> <code>{len(accounts)}</code>")
+        
+        async def report_task(phone, session_str):
+            client = await self._get_client(phone, session_str)
+            if not client: return
+            
+            peer = None
             try:
-                await client.send_message(entity, message_to_send)
-                logger.info(f"Spam message sent by {phone} to {getattr(entity, 'title', entity.id)}")
-                await asyncio.sleep(random.randint(3, 7))
-            except UserNotParticipantError:
-                 await client(functions.channels.JoinChannelRequest(entity))
-                 await asyncio.sleep(3)
-                 await client.send_message(entity, message_to_send)
-                 logger.info(f"Joined and sent spam from {phone} to {getattr(entity, 'title', entity.id)}")
+                try:
+                    updates = await client(functions.messages.ImportChatInviteRequest(invite_hash))
+                    peer = next((chat for chat in updates.chats), None)
+                    logger.info(f"Account {phone} joined via {invite_link}")
+                except UserAlreadyParticipantError:
+                    logger.info(f"Account {phone} already in chat, resolving peer...")
+                    invite_info = await client(functions.messages.CheckChatInviteRequest(invite_hash))
+                    if hasattr(invite_info, 'chat'):
+                        peer = await client.get_entity(invite_info.chat)
+                
+                if not peer:
+                    logger.error(f"Could not resolve peer for {phone} using invite link. Aborting.")
+                    self._inc_stat("report_errors")
+                    return
+                
+                await client(functions.messages.ReportRequest(
+                    peer=peer,
+                    id=[message_id],
+                    reason=types.InputReportReasonSpam(message="")
+                ))
+                logger.info(f"Account {phone} reported message {msg_link}")
+                self._inc_stat("report_success")
+                await asyncio.sleep(random.uniform(1, 3))
+
+            except (InviteHashExpiredError, InviteHashInvalidError):
+                logger.error(f"Invite link is invalid or expired for {phone}.")
+                self._inc_stat("report_errors")
+            except MessageIdInvalidError:
+                logger.error(f"Message ID invalid for {phone}. Maybe deleted or not visible.")
+                self._inc_stat("report_errors")
             except Exception as e:
-                 logger.error(f"Spam error from {phone} to {getattr(entity, 'title', entity.id)}: {e}")
+                logger.error(f"Report error from {phone}: {e}")
+                self._inc_stat("report_errors")
+
+        tasks = [self.semaphore_wrapper(report_task, phone, session_str) for phone, session_str in accounts.items()]
+        await asyncio.gather(*tasks)
+
+        stats = self.db.get("MultiFarm", "stats", {})
+        success_count = stats.get("report_success", 0)
+
+        await msg.edit(f"<b>✅ Рейд завершен.</b>\n<b>Всего успешных жалоб:</b> <code>{success_count}</code>")
 
     @loader.command(ru_doc="<ссылка> - Запустить бота по реф. ссылке")
     async def mf_startref(self, message):
@@ -260,15 +363,16 @@ class MultiFarmMod(loader.Module):
         accounts = self.db.get("MultiFarm", "accounts", {})
         if not accounts: return await utils.answer(message, "🚫 <b>Нет добавленных аккаунтов.</b>")
             
-        for phone, session_str in accounts.items():
+        async def start_task(phone, session_str):
             client = await self._get_client(phone, session_str)
-            if not client: continue
+            if not client: return
             try:
                 await client.send_message(bot_username, command)
-                logger.info(f"Account {phone} sent '{command}' to @{bot_username}")
                 await asyncio.sleep(random.randint(2, 5))
-            except Exception as e:
-                logger.error(f"Ref start error from {phone}: {e}")
+            except Exception: pass
+        
+        tasks = [self.semaphore_wrapper(start_task, p, s) for p, s in accounts.items()]
+        await asyncio.gather(*tasks)
                 
         await utils.answer(message, self.strings("ref_done"))
 
@@ -279,15 +383,20 @@ class MultiFarmMod(loader.Module):
         if not api_key: return await utils.answer(message, self.strings("ai_no_key"))
         
         await utils.answer(message, self.strings("ai_request"))
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-pro')
-        
-        current_config_str = json.dumps(self.config.to_dict(), indent=2)
-        prompt = utils.get_args_raw(message) or self.config["gemini_prompt"]
-        full_prompt = f"{prompt}\n\nHere is the current config:\n{current_config_str}"
         
         try:
-            response = await model.generate_content_async(full_prompt)
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(self.config["gemini_model"])
+            
+            current_config_dict = {key: self.config[key] for key in self.config}
+            prompt = utils.get_args_raw(message) or self.config["gemini_prompt"]
+            full_prompt = f"{prompt}\n\nHere is the current config:\n{json.dumps(current_config_dict, indent=2)}"
+            
+            def generate():
+                return model.generate_content(full_prompt)
+
+            response = await asyncio.to_thread(generate)
+            
             response_text = response.text.strip().replace("`", "").replace("json", "")
             changes = json.loads(response_text)
             
@@ -303,26 +412,102 @@ class MultiFarmMod(loader.Module):
 
         except Exception as e:
             await utils.answer(message, self.strings("ai_fail").format(e=e))
+
+    @loader.command(ru_doc="- Показать статистику работы модуля")
+    async def mf_stats(self, message):
+        stats = self.db.get("MultiFarm", "stats", {})
+        accounts = self.db.get("MultiFarm", "accounts", {})
+        target_chats_str = self.config.get("target_chat", "")
+        target_chats = [chat for chat in target_chats_str.split(',') if chat.strip()] if target_chats_str else []
+
+        start_time = stats.get("start_time", time.time())
+        uptime_seconds = time.time() - start_time
+        
+        def format_uptime(seconds):
+            days, rem = divmod(seconds, 86400)
+            hours, rem = divmod(rem, 3600)
+            minutes, _ = divmod(rem, 60)
+            uptime_str = ""
+            if days: uptime_str += f"{int(days)}д "
+            if hours: uptime_str += f"{int(hours)}ч "
+            if minutes: uptime_str += f"{int(minutes)}м"
+            return uptime_str if uptime_str else "меньше минуты"
+
+        spam_s = stats.get("spam_success", 0)
+        spam_e = stats.get("spam_errors", 0)
+        spam_total = spam_s + spam_e
+        spam_rate = (spam_s / spam_total * 100) if spam_total > 0 else 0
+
+        report_s = stats.get("report_success", 0)
+        report_e = stats.get("report_errors", 0)
+        report_total = report_s + report_e
+        report_rate = (report_s / report_total * 100) if report_total > 0 else 0
+
+        text = (f"📊 <b>Статистика MultiFarm</b>\n\n"
+                f"<b>🚀 Общее:</b>\n"
+                f"  <b>• Время работы:</b> <code>{format_uptime(uptime_seconds)}</code>\n"
+                f"  <b>• Активных аккаунтов:</b> <code>{len(accounts)}</code>\n"
+                f"  <b>• Таргет-чатов:</b> <code>{len(target_chats)}</code>\n\n"
+                f"<b>📨 Рассылка:</b>\n"
+                f"  <b>• ✅ Успешно:</b> <code>{spam_s}</code>\n"
+                f"  <b>• ❌ Ошибок:</b> <code>{spam_e}</code>\n"
+                f"  <b>• 📈 Успешность:</b> <code>{spam_rate:.2f}%</code>\n\n"
+                f"<b>🚜 Ферма:</b>\n"
+                f"  <b>• 👁️ Iris:</b> <code>{stats.get('iris_farm_count', 0)}</code>\n"
+                f"  <b>• 📊 FunStat:</b> <code>{stats.get('funstat_farm_count', 0)}</code>\n\n"
+                f"<b>🛡️ Жалобы:</b>\n"
+                f"  <b>• ✅ Успешно:</b> <code>{report_s}</code>\n"
+                f"  <b>• ❌ Ошибок:</b> <code>{report_e}</code>\n"
+                f"  <b>• 📈 Успешность:</b> <code>{report_rate:.2f}%</code>\n\n"
+                f"<i>Используй <code>.mf_resetstats</code> для сброса.</i>")
+
+        await utils.answer(message, text)
+
+    @loader.command(ru_doc="- Сбросить статистику модуля")
+    async def mf_resetstats(self, message):
+        self.db.set("MultiFarm", "stats", {"start_time": time.time()})
+        await utils.answer(message, "<b>✅ Статистика сброшена.</b>")
+
+    @loader.command(ru_doc="- Справка по модулю")
+    async def mf_doc(self, message):
+        text = (f"📖 <b>Справка по модулю MultiFarm</b>\n\n"
+                f"Этот модуль — ваш личный командный центр для управления армией Telegram-аккаунтов. Он предназначен для автоматизации фарма, рассылок и других действий.\n\n"
+                f"<b>Основные команды:</b>\n"
+                f"• <code>.mf_add &lt;+7...|сессия&gt;</code> - Добавить новый аккаунт.\n"
+                f"• <code>.mf_manage</code> - Интерактивное меню управления аккаунтами.\n"
+                f"• <code>.mf_config</code> - Показать текущие настройки модуля.\n"
+                f"• <code>.mf_stats</code> - Показать детальную статистику работы.\n"
+                f"• <code>.mf_resetstats</code> - Сбросить статистику.\n\n"
+                f"<b>Команды действий:</b>\n"
+                f"• <code>.mf_targtx &lt;текст&gt;</code> - Разовая рассылка вашего текста по целям.\n"
+                f"• <code>.mf_report &lt;инвайт&gt; &lt;ссылка&gt;</code> - (BETA) Рейд жалобами на сообщение.\n"
+                f"• <code>.mf_startref &lt;ссылка&gt;</code> - Запустить бота по реф. ссылке со всех аккаунтов.\n"
+                f"• <code>.mf_force</code> - Принудительно запустить все активные задачи, игнорируя таймеры.\n\n"
+                f"<b>Продвинутые функции:</b>\n"
+                f"• <code>.mf_ai [промпт]</code> - Оптимизировать настройки с помощью ИИ.\n"
+                f"• <b>Anti-Spam:</b> Модуль использует Spintax в сообщениях (<code>{'{привет|здарова}'}</code>), имитацию печати и динамические задержки для снижения риска бана.\n\n"
+                f"<b>Канал разработчика:</b> @TypeModules")
+        await utils.answer(message, text)
     
     # --- Account Management ---
-    
     @loader.command(ru_doc="<номер | string session> - Добавить аккаунт")
     async def mf_add(self, message):
         arg = utils.get_args_raw(message)
         if not arg: return await utils.answer(message, self.strings("no_arg_add"))
         api_id, api_hash = await self.get_api_credentials()
-        sender_id = message.sender_id; client = None
+        sender_id = message.sender_id
         try:
             if arg.startswith("+"):
                 if sender_id in self.pending_login: 
                     await self.pending_login[sender_id].get("client").disconnect()
-                    del self.pending_login[sender_id]
-                client = TelegramClient(StringSession(), api_id, api_hash); await client.connect()
+                client = TelegramClient(StringSession(), api_id, api_hash)
+                await client.connect()
                 code_hash = await client.send_code_request(arg)
                 self.pending_login[sender_id] = {"client": client, "phone": arg, "phone_code_hash": code_hash.phone_code_hash, "state": "code"}
                 await utils.answer(message, self.strings("code_sent"))
             else:
-                client = TelegramClient(StringSession(arg), api_id, api_hash); await client.connect()
+                client = TelegramClient(StringSession(arg), api_id, api_hash)
+                await client.connect()
                 await self._finalize_login(client, message, self.strings("session_added"))
         except Exception as e: 
             await utils.answer(message, self.strings("login_fail").format(e=e))
@@ -357,12 +542,9 @@ class MultiFarmMod(loader.Module):
 
     async def _finalize_login(self, client, message, success_template):
         me = await client.get_me()
-        
         try:
             await client(functions.channels.JoinChannelRequest("iris_cm"))
-            logger.info(f"Account +{me.phone} successfully joined @iris_cm.")
-        except Exception as e:
-            logger.warning(f"Could not join @iris_cm for +{me.phone}: {e}")
+        except Exception: pass
 
         session_str = StringSession.save(client.session)
         phone = f"+{me.phone}"
@@ -370,13 +552,11 @@ class MultiFarmMod(loader.Module):
         accounts[phone] = session_str
         self.db.set("MultiFarm", "accounts", accounts)
         
-        if client is not self.client and client.is_connected():
+        if client.is_connected():
             await client.disconnect()
 
         await utils.answer(message, success_template.format(name=utils.escape_html(me.first_name)))
-        
-        # Auto-update manage menu after adding
-        await self.mf_managecmd(await self.client.send_message(message.peer_id, "Updating manage menu..."))
+        await self.mf_manage(await self.client.send_message(message.peer_id, "Updating manage menu..."))
 
     @loader.command(ru_doc="<реплай на .session> - Добавить акк через файл")
     async def mf_session(self, message):
@@ -389,117 +569,71 @@ class MultiFarmMod(loader.Module):
         try:
             async with TelegramClient(SQLiteSession(path), api_id, api_hash) as client:
                 me = await client.get_me()
-                
-                try:
-                    await client(functions.channels.JoinChannelRequest("iris_cm"))
-                    logger.info(f"Account +{me.phone} successfully joined @iris_cm via session file.")
-                except Exception as e:
-                    logger.warning(f"Could not join @iris_cm for +{me.phone} via session file: {e}")
-                    
                 phone = f"+{me.phone}"
                 accounts = self.db.get("MultiFarm", "accounts", {})
                 accounts[phone] = StringSession.save(client.session)
                 self.db.set("MultiFarm", "accounts", accounts)
                 await utils.answer(message, f"✅ <b>Аккаунт {utils.escape_html(me.first_name)} ({phone}) добавлен!</b>")
-                await self.mf_managecmd(await self.client.send_message(message.peer_id, "Updating manage menu...")) # Auto-update manage menu
+                await self.mf_manage(await self.client.send_message(message.peer_id, "Updating manage menu..."))
         except Exception as e: await utils.answer(message, f"❌ <b>Ошибка:</b> {e}")
         finally: 
             if os.path.exists(path): os.remove(path)
 
     @loader.command(ru_doc="- Управление аккаунтами")
-    async def mf_managecmd(self, message):
-        accounts = self.db.get("MultiFarm", "accounts", {})
+    async def mf_manage(self, message):
         await self._show_accounts_page(message, 0)
     
-    @loader.command(ru_doc="- Настройки модуля")
-    async def mf_config(self, message):
-        status = "🟢" if self.config["status"] else "🔴"
-        funstat = "🟢" if self.config["farm_funstat"] else "🔴"
-        iris = "🟢" if self.config["farm_iris"] else "🔴"
-        spam = "🟢" if self.config["spam_mode"] else "🔴"
+    @loader.command(ru_doc="<текст> - Рассылка своего текста в таргет")
+    async def mf_targtx(self, message):
+        text = utils.get_args_raw(message)
+        if not text: return await utils.answer(message, "<b>❌ Укажи текст.</b>")
+        if not self.config["target_chat"]: return await utils.answer(message, "<b>❌ Цель не указана.</b>")
+        accounts = self.db.get("MultiFarm", "accounts", {})
+        if not accounts: return await utils.answer(message, "🚫 <b>Нет аккаунтов.</b>")
+        msg = await utils.answer(message, f"<b>🔥 Начинаю рассылку...</b>")
         
-        txt = (f"⚙️ <b>Настройки MultiFarm</b>\n\n"
-               f"{status} <b>Общий статус</b>\n\n"
-               f"<b>🚜 Ферма:</b>\n"
-               f"{funstat} FunStat | КД: <code>{self.config['funstat_interval']}</code>\n"
-               f"{iris} Iris | КД: <code>{self.config['iris_interval']}</code>\n\n"
-               f"<b>📨 Рассылка:</b>\n"
-               f"{spam} Статус | КД: <code>{self.config['spam_interval']}</code>\n"
-               f"🎯 <b>Цель:</b> <code>{self.config['target_chat']}</code>\n\n"
-               f"<b>🧠 ИИ-контроль:</b>\n"
-               f"🔑 <b>Gemini Key:</b> {'✅ Установлен' if self.config['gemini_api_key'] else '❌ Не установлен'}\n"
-               f"👤 <b>Админ для логов:</b> <code>{self.config['admin_id']}</code>\n\n"
-               f"<i>Используй <code>.config MultiFarm</code> для редактирования.</i>")
-        await utils.answer(message, txt)
+        tasks = []
+        for phone, session in accounts.items():
+            async def spam_task(p, s):
+                client = await self._get_client(p, s)
+                if client:
+                    await self._do_spam(client, p, custom_message=text)
+            
+            tasks.append(self.semaphore_wrapper(spam_task, phone, session))
+
+        await asyncio.gather(*tasks)
+        await msg.edit(f"<b>✅ Рассылка завершена.</b>")
 
     @loader.command(ru_doc="- Принудительно запустить все активные задачи")
     async def mf_force(self, message):
-        """Forces an immediate run of all enabled tasks, ignoring cooldowns"""
         accounts = self.db.get("MultiFarm", "accounts", {})
-        if not accounts:
-            return await utils.answer(message, "🚫 <b>Нет добавленных аккаунтов для запуска.</b>")
-
-        msg = await utils.answer(message, f"<b>🚀 Принудительно запускаю задачи на {len(accounts)} аккаунтах...</b>")
-
-        success_count = 0
-        for phone, session_str in accounts.items():
-            client = await self._get_client(phone, session_str)
-            if not client: continue
-            try:
-                if self.config["farm_iris"]:
-                    await self._farm_iris(client, phone)
-                    await asyncio.sleep(random.uniform(1, 2))
-                if self.config["farm_funstat"]:
-                    await self._farm_funstat(client, phone)
-                    await asyncio.sleep(random.uniform(1, 2))
-                if self.config["spam_mode"]:
-                    await self._do_spam(client, phone)
-                    await asyncio.sleep(random.uniform(1, 2))
-                success_count += 1
-                logger.info(f"[FORCED] Tasks executed for {phone}")
-            except Exception as e:
-                logger.error(f"[FORCED] Error on account {phone}: {e}")
-            await asyncio.sleep(random.randint(2, 5))
-        await msg.edit(f"<b>✅ Принудительный запуск завершен.</b>\n<b>Успешно обработано:</b> <code>{success_count}/{len(accounts)}</code>")
-
-    @loader.command(ru_doc="<текст> - Рассылка своего текста в таргет")
-    async def mf_targtx(self, message):
-        """One-off spam to target with custom text"""
-        text = utils.get_args_raw(message)
-        if not text:
-            return await utils.answer(message, "<b>❌ Укажи текст для рассылки.</b>")
-
-        if not self.config["target_chat"]:
-            return await utils.answer(message, "<b>❌ Цель для рассылки (target_chat) не указана в конфиге.</b>")
-
-        accounts = self.db.get("MultiFarm", "accounts", {})
-        if not accounts:
-            return await utils.answer(message, "🚫 <b>Нет добавленных аккаунтов для рассылки.</b>")
-
-        msg = await utils.answer(message, f"<b>🔥 Начинаю рассылку на {len(accounts)} аккаунтах...</b>")
+        if not accounts: return await utils.answer(message, "🚫 <b>Нет аккаунтов.</b>")
+        msg = await utils.answer(message, f"<b>🚀 Принудительно запускаю задачи...</b>")
         
-        success_count = 0
-        for phone, session_str in accounts.items():
-            client = await self._get_client(phone, session_str)
-            if not client: continue
+        async def force_run(p, s):
+            client = await self._get_client(p, s)
+            if not client: return
             try:
-                await self._do_spam(client, phone, custom_message=text)
-                success_count += 1
+                if self.config["farm_iris"]: await self._farm_iris(client, p)
+                if self.config["farm_funstat"]: await self._farm_funstat(client, p)
+                if self.config["spam_mode"]: await self._do_spam(client, p)
             except Exception as e:
-                logger.error(f"[TGTX_SPAM] Error on account {phone}: {e}")
-            await asyncio.sleep(random.randint(2, 5))
+                logger.error(f"Forced task error for {p}: {e}")
         
-        await msg.edit(f"<b>✅ Рассылка завершена.</b>\n<b>Успешно отправлено с:</b> <code>{success_count}/{len(accounts)}</code> <b>аккаунтов.</b>")
-
+        tasks = [self.semaphore_wrapper(force_run, p, s) for p, s in accounts.items()]
+        await asyncio.gather(*tasks)
+        await msg.edit(f"<b>✅ Запуск завершен.</b>")
 
     # --- Helpers & Inline ---
     async def get_api_credentials(self):
-        return (self.config["api_id"], self.config["api_hash"]) if self.config["api_id"] else (self.client.api_id, self.client.api_hash)
+        return (self.config["api_id"], self.config["api_hash"]) if self.config["api_id"] and self.config["api_hash"] else (self.client.api_id, self.client.api_hash)
 
     async def _get_client(self, phone, session_str):
-        if phone in self.active_clients and self.active_clients[phone].is_connected(): return self.active_clients[phone]
+        if phone in self.active_clients and self.active_clients.get(phone).is_connected():
+            return self.active_clients[phone]
+        
         api_id, api_hash = await self.get_api_credentials()
-        client = TelegramClient(StringSession(session_str), api_id, api_hash)
+        client = TelegramClient(StringSession(session_str), api_id, api_hash, flood_sleep_threshold=120)
         try:
             await client.connect()
             if not await client.is_user_authorized(): raise ConnectionError("Revoked session")
@@ -515,31 +649,29 @@ class MultiFarmMod(loader.Module):
 
     async def _show_accounts_page(self, m, page):
         accounts = list(self.db.get("MultiFarm", "accounts", {}).keys())
-        no_accounts = not accounts
         
-        if no_accounts:
+        if not accounts:
             text = "🚫 <b>Нет добавленных аккаунтов.</b>"
-            keyboard = [[{"text": "➕ Добавить аккаунт", "callback": self._add_account_prompt}],[{"text": "❌ Закрыть", "action": "close"}]]
+            kb = [[{"text": "➕ Добавить", "callback": self._add_account_prompt}],[{"text": "❌ Закрыть", "action": "close"}]]
         else:
-            chunk_size = 5
-            total_pages = (len(accounts) + chunk_size - 1) // chunk_size or 1
-            current_items = accounts[page * chunk_size : (page + 1) * chunk_size]
-            keyboard = [[{"text": f"👤 {phone}", "callback": self._account_menu, "args": [phone]}] for phone in current_items]
+            chunk = 5
+            pages = (len(accounts) + chunk - 1) // chunk or 1
+            items = accounts[page * chunk : (page + 1) * chunk]
+            kb = [[{"text": f"👤 {p}", "callback": self._account_menu, "args": [p]}] for p in items]
             
             nav = []
             if page > 0: nav.append({"text": "⬅️", "callback": self._paginate, "args": [page - 1]})
             nav.append({"text": "➕", "callback": self._add_account_prompt})
-            if page < total_pages - 1: nav.append({"text": "➡️", "callback": self._paginate, "args": [page + 1]})
+            if page < pages - 1: nav.append({"text": "➡️", "callback": self._paginate, "args": [page + 1]})
             
-            keyboard.append(nav)
-            keyboard.append([{"text": "❌ Закрыть", "action": "close"}])
-            text = f"👥 <b>Аккаунты (Стр. {page + 1}/{total_pages})</b>"
+            kb.append(nav)
+            kb.append([{"text": "❌ Закрыть", "action": "close"}])
+            text = f"👥 <b>Аккаунты (Стр. {page + 1}/{pages})</b>"
 
-        if " form" in str(type(m)): # Check if it's an inline form
-             await m.edit(text=text, reply_markup=keyboard)
+        if hasattr(m, 'form'):
+             await m.edit(text=text, reply_markup=kb)
         else:
-             await self.inline.form(text=text, message=m, reply_markup=keyboard)
-
+             await self.inline.form(text=text, message=m, reply_markup=kb)
 
     async def _paginate(self, call, page): await self._show_accounts_page(call, int(page))
     async def _account_menu(self, call, phone): await call.edit(f"👤 <b>Управление:</b> <code>{phone}</code>", reply_markup=[[{"text": "🗑 Удалить", "callback": self._delete_acc_confirm, "args": [phone]}], [{"text": "🔙 Назад", "callback": self._paginate, "args": [0]}]])
@@ -547,8 +679,7 @@ class MultiFarmMod(loader.Module):
     async def _delete_acc_confirm(self, call, phone): await call.edit(f"⚠️ <b>Удалить {phone}?</b>", reply_markup=[[{"text": "✅ Да", "callback": self._delete_acc_do, "args": [phone]}], [{"text": "❌ Нет", "callback": self._account_menu, "args": [phone]}]])
     async def _delete_acc_do(self, call, phone):
         accounts = self.db.get("MultiFarm", "accounts", {}); del accounts[phone]; self.db.set("MultiFarm", "accounts", accounts)
-        if phone in self.active_clients: await self.active_clients.pop(phone).disconnect()
+        if phone in self.active_clients and self.active_clients.get(phone).is_connected():
+            await self.active_clients.pop(phone).disconnect()
         await call.answer("Аккаунт удален.")
-        
-        # Auto-update manage menu after deleting
         await self._show_accounts_page(call, 0)
