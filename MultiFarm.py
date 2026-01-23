@@ -82,6 +82,8 @@ class MultiFarmMod(loader.Module):
         self.pending_login = {}
         self.task_loop_task = None
         self.semaphore = None
+        self._target_failure_counts = {}
+        self._target_failure_lock = asyncio.Lock()
 
     async def client_ready(self, client, db):
         self.client = client
@@ -182,39 +184,56 @@ class MultiFarmMod(loader.Module):
                 await asyncio.sleep(60)
                 continue
 
+            # Reset failure counts for this run
+            async with self._target_failure_lock:
+                self._target_failure_counts.clear()
+
             tasks = [self.semaphore_wrapper(self._run_account_tasks, phone, session) for phone, session in accounts.items()]
             await asyncio.gather(*tasks)
+
+            await self._prune_dead_targets()
             
             await asyncio.sleep(60)
 
-    async def _ensure_bot_started(self, client, phone, bot_name, start_link):
-        initialized = self.db.get("MultiFarm", "initialized_bots", {})
-        if phone not in initialized: initialized[phone] = []
-        if bot_name in initialized[phone]: return True
-        
-        try:
-            match = re.search(r"t\.me/(\w+)\?start=(\w+)", start_link)
-            if not match: return False
-            bot_username, start_payload = match.groups()
-            await client.send_message(bot_username, f"/start {start_payload}")
-            logger.info(f"Account {phone} started @{bot_username} for {bot_name}")
-            initialized[phone].append(bot_name)
-            self.db.set("MultiFarm", "initialized_bots", initialized)
-            await asyncio.sleep(5)
-            return True
-        except Exception as e:
-            logger.error(f"Failed to start {bot_name} for {phone}: {e}")
-            return False
+    async def _prune_dead_targets(self):
+        async with self._target_failure_lock:
+            if not self._target_failure_counts:
+                return
+
+            num_accounts = len(self.db.get("MultiFarm", "accounts", {}))
+            dead_targets = {target for target, count in self._target_failure_counts.items() if count >= num_accounts}
+
+            if dead_targets:
+                logger.info(f"Found {len(dead_targets)} globally dead targets. Pruning from config.")
+                current_targets = [t.strip() for t in self.config["target_chat"].split(',')]
+                new_targets = [t for t in current_targets if t not in dead_targets]
+                self.config["target_chat"] = ", ".join(new_targets)
+
+                if self.config["admin_id"]:
+                    removed_str = "\n".join([f"• <code>{utils.escape_html(t)}</code>" for t in dead_targets])
+                    try:
+                        await self.client.send_message(
+                            self.config["admin_id"],
+                            f"<b>🗑️ MultiFarm | Мёртвые цели удалены</b>\n\n"
+                            f"Следующие цели невалидны для всех аккаунтов и были удалены из конфига:\n{removed_str}"
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send admin notification about pruned targets: {e}")
 
     async def _farm_funstat(self, client, phone):
-        await self._ensure_bot_started(client, phone, "funstat", "https://funstat.info/?start=010125DE6DEA01000000")
-        target = self.config["target_chat"] if self.config["target_chat"] else "@flood"
+        targets = [t.strip() for t in self.config["target_chat"].split(',')] if self.config["target_chat"] else []
+        target = targets[0] if targets else "@flood"
+        
         message = self.config["funstat_spam_message"]
         if "@funstatbot" not in message: message += " @funstatbot"
         
-        await client.send_message(target, message)
-        self._inc_stat("funstat_farm_count")
-        logger.info(f"Farming FunStat with {phone} in {target}")
+        try:
+            await self._ensure_bot_started(client, phone, "funstat", "https://funstat.info/?start=010125DE6DEA01000000")
+            await client.send_message(target, message)
+            self._inc_stat("funstat_farm_count")
+            logger.info(f"Farming FunStat with {phone} in {target}")
+        except Exception:
+            logger.error(f"Failed to farm funstat in {target} for {phone}")
 
     async def _farm_iris(self, client, phone):
         await client.send_message("@iris_cm_bot", "фарма")
@@ -249,8 +268,10 @@ class MultiFarmMod(loader.Module):
 
         message_to_send = custom_message or self.config["message"]
         
+        blacklist = self.db.get("MultiFarm", "per_account_blacklist", {}).get(phone, [])
+        chat_list = [chat.strip() for chat in target_config.split(',') if chat.strip() and chat.strip() not in blacklist]
+        
         targets = []
-        chat_list = [chat.strip() for chat in target_config.split(',') if chat.strip()]
         for chat_identifier in chat_list:
             try:
                 if 'joinchat/' in chat_identifier or '/+' in chat_identifier:
@@ -264,7 +285,15 @@ class MultiFarmMod(loader.Module):
                 try: targets.append(await client.get_entity(chat_identifier))
                 except Exception: pass
             except Exception:
-                logger.error(f"Could not process target '{chat_identifier}' for {phone}")
+                logger.error(f"Could not process target '{chat_identifier}' for {phone}. Blacklisting.")
+                blacklist.append(chat_identifier)
+                async with self._target_failure_lock:
+                    self._target_failure_counts[chat_identifier] = self._target_failure_counts.get(chat_identifier, 0) + 1
+
+        # Update per-account blacklist in DB
+        bl_db = self.db.get("MultiFarm", "per_account_blacklist", {})
+        bl_db[phone] = blacklist
+        self.db.set("MultiFarm", "per_account_blacklist", bl_db)
 
         if not targets:
             return
