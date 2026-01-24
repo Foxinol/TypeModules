@@ -1,0 +1,143 @@
+# Modification of the module is allowed only if the license is retained.
+# MMP""MM""YMM `7MMF' `7MF' `7MM"""Mq. 7MM"""YMM
+# P' MM `7 `MA ,V MM `MM. MM 7
+# MM VM: ,V MM ,M9 MM d
+# MM MM. M' MMmmdM9 MMmmMM
+# MM `MM A' MM MM Y ,
+# MM :MM; MM MM ,M
+# .JMML. VF .JMML. .JMMmmmmMMM
+# ,M
+# This module is licensed and fully copyrighted by Type, copyright is allowed while maintaining the author's mention in the code.
+# meta developer: @TypeModules
+
+import logging
+import aiohttp
+from .. import loader, utils
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_STRINGS = {
+    "name": "PhoneChecker",
+    "no_key": "🚫 <b>API ключ не установлен.</b>\nПолучи его на <a href='https://numlookupapi.com/'>numlookupapi.com</a> и установи командой <code>.hlrkey &lt;ключ&gt;</code>",
+    "key_set": "🔑 <b>API ключ успешно установлен.</b>",
+    "no_phone": "🤔 <b>Укажи номер телефона для проверки.</b>",
+    "processing": "🔄 <b>Обрабатываю запрос...</b>",
+    "api_error_detailed": "❗️ <b>Ошибка API:</b> <code>{error}</code>",
+    "api_error_generic": "❗️ <b>Ошибка API.</b> Проверь правильность номера, API ключ или лимиты на сервисе.",
+    "phone_info": (
+        "📱 <b>Информация о номере</b> <code>{number}</code>\n\n"
+        "✔️ <b>Валидность:</b> {valid}\n"
+        "🗺️ <b>Страна:</b> <code>{country} ({country_code})</code>\n"
+        "📍 <b>Регион:</b> <code>{location}</code>\n"
+        "📡 <b>Оператор:</b> <code>{carrier}</code>\n"
+        "☎️ <b>Тип линии:</b> <code>{line_type}</code>"
+    ),
+}
+
+PREMIUM_STRINGS = {
+    "name": "PhoneChecker",
+    "no_key": "<emoji document_id=5258318620722733379>❌</emoji> <b>API ключ не установлен.</b>\nПолучи его на <a href='https://numlookupapi.com/'>numlookupapi.com</a> и установи командой <code>.hlrkey &lt;ключ&gt;</code>",
+    "key_set": "<emoji document_id=5260726538302660868>✅</emoji> <b>API ключ успешно установлен.</b>",
+    "no_phone": "<emoji document_id=5257991477358763590>↗️</emoji> <b>Укажи номер телефона для проверки.</b>",
+    "processing": "<emoji document_id=5454074580010295588>😀</emoji> <b>Обрабатываю запрос...</b>",
+    "api_error_detailed": "<emoji document_id=5260249440450520061>🤚</emoji> <b>Ошибка API:</b> <code>{error}</code>",
+    "api_error_generic": "<emoji document_id=5260249440450520061>🤚</emoji> <b>Ошибка API.</b> Проверь правильность номера, API ключ или лимиты на сервисе.",
+    "phone_info": (
+        "<emoji document_id=5294096239464295059>🔵</emoji> <b>Информация о номере</b> <code>{number}</code>\n\n"
+        "<emoji document_id=5454156248813432363>🎥</emoji> <b>Валидность:</b> {valid}\n"
+        "<emoji document_id=5397730656400714154>🏳️</emoji> <b>Страна:</b> <code>{country} ({country_code})</code>\n"
+        "<emoji document_id=5429571366384842791>🔎</emoji> <b>Регион:</b> <code>{location}</code>\n"
+        "<emoji document_id=5258503720928288433>ℹ️</emoji> <b>Оператор:</b> <code>{carrier}</code>\n"
+        "<emoji document_id=5258337316715373336>🤙</emoji> <b>Тип линии:</b> <code>{line_type}</code>"
+    ),
+}
+
+@loader.tds
+class PhoneCheckerMod(loader.Module):
+    """Модуль для проверки информации о номере телефона через HLR-подобный запрос."""
+
+    strings = DEFAULT_STRINGS
+    _is_premium = False
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "api_key",
+                None,
+                "API ключ от numlookupapi.com",
+                validator=loader.validators.Hidden(),
+            )
+        )
+
+    def _get_string(self, key):
+        """Возвращает строку в зависимости от премиум-статуса."""
+        if self._is_premium:
+            return PREMIUM_STRINGS.get(key, f"STRING {key} NOT FOUND")
+        return DEFAULT_STRINGS.get(key, f"STRING {key} NOT FOUND")
+
+    async def client_ready(self, client, db):
+        self.client = client
+        me = await self.client.get_me()
+        if me and me.premium:
+            self._is_premium = True
+
+    async def hlrkeycmd(self, message):
+        """<ключ> - Установить API ключ для numlookupapi."""
+        key = utils.get_args_raw(message)
+        if not key:
+            await utils.answer(message, "🤔 <b>Укажи API ключ.</b>")
+            return
+        
+        self.config["api_key"] = key
+        await utils.answer(message, self._get_string("key_set"))
+
+    async def hlrcmd(self, message):
+        """<номер телефона> - Проверить номер телефона."""
+        if not self.config["api_key"]:
+            await utils.answer(message, self._get_string("no_key"))
+            return
+
+        phone_number = utils.get_args_raw(message)
+        if not phone_number:
+            await utils.answer(message, self._get_string("no_phone"))
+            return
+
+        message = await utils.answer(message, self._get_string("processing"))
+        
+        cleaned_phone = "".join(filter(str.isdigit, phone_number.replace('+', '')))
+
+        api_url = f"https://api.numlookupapi.com/v1/validate/{cleaned_phone}"
+        headers = {"apikey": self.config["api_key"]}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, headers=headers) as response:
+                    data = await response.json()
+        except Exception as e:
+            logger.error(f"PhoneChecker API request failed: {e}")
+            await utils.answer(message, self._get_string("api_error_generic"))
+            return
+
+        if "valid" not in data:
+            error_message = data.get("message", "Неизвестная ошибка")
+            await utils.answer(message, self._get_string("api_error_detailed").format(error=error_message))
+            return
+
+        valid_status = "Да" if data.get("valid") else "Нет"
+        country_name = data.get("country_name", "Неизвестно")
+        country_code = data.get("country_code", "N/A")
+        location = data.get("location", "Неизвестно")
+        carrier = data.get("carrier", "Неизвестно")
+        line_type = data.get("line_type", "Неизвестно")
+
+        reply_text = self._get_string("phone_info").format(
+            number=utils.escape_html(phone_number),
+            valid=valid_status,
+            country=country_name,
+            country_code=country_code,
+            location=location,
+            carrier=carrier,
+            line_type=line_type.capitalize() if line_type else "Неизвестно",
+        )
+
+        await utils.answer(message, reply_text)
