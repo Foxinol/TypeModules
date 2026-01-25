@@ -1,0 +1,230 @@
+# Modification of the module is allowed only if the license is retained.
+# MMP""MM""YMM `7MMF'   `7MF' `7MM"""Mq.  7MM"""YMM
+# P'   MM   `7   `MA     ,V     MM   `MM.  MM    7
+#     MM         VM:   ,V      MM   ,M9   MM   d
+#     MM          MM.  M'      MMmmdM9    MMmmMM
+#     MM          `MM A'       MM         MM   Y  ,
+#     MM           :MM;        MM         MM     ,M
+#   .JMML.          VF       .JMML.     .JMMmmmmMMM
+#                  ,M
+# This module is licensed and fully copyrighted by Type, copyright is allowed while maintaining the author's mention in the code.
+# meta developer: @TypeModules
+
+# requires: pylast yandex-music aiohttp
+
+import asyncio
+import re
+import json
+import random
+import string
+
+import aiohttp
+import pylast
+import yandex_music
+from yandex_music.exceptions import UnauthorizedError, NotFoundError
+
+from .. import loader, utils
+
+@loader.tds
+class Lfm(loader.Module):
+    """Гибридный модуль статуса музыки (Yandex Live Lyrics + Last.fm)"""
+
+    strings = {
+        "name": "HybridMusic",
+        "ym_live": "<emoji document_id=5873146865637133757>🎤</emoji> <b>{current}</b>\n\n<emoji document_id=5222108309795908493>✨</emoji> <i>{next}</i>\n\n<b>{artist} — {title}</b>\n{link}",
+        "lfm_playing_lyrics": "<emoji document_id=5873146865637133757>🎤</emoji> <b>{artist} — {title}</b>\n\n<pre>{lyrics}</pre>\n\n{link}",
+        "lfm_playing": "<emoji document_id=5873146865637133757>🎤</emoji> <b>{artist} — {title}</b>\n\n{link}",
+        "no_lyrics": "<emoji document_id=5422873450786079977>😔</emoji> <b>Текст для этого трека не найден.</b>",
+        "no_playing": "<emoji document_id=5409230238062247909>🔝</emoji> <b>Ничего не играет</b>",
+        "paused": "<emoji document_id=5411192398166396991>💣</emoji> <b>Трек на паузе</b>",
+        "not_configured": "❌ <b>Не настроен Last.fm.</b>\nНужны API-ключи и ник:\n`.config Lfm api_key <ключ>`\n`.config Lfm api_secret <секрет>`\n`.config Lfm username <ник>`",
+        "ym_link": "<emoji document_id=5213323516832667837>🎵</emoji> <a href='https://music.yandex.ru/track/{track_id}'>Открыть в Яндекс.Музыке</a>",
+        "loading": "<i>Запускаю музыкальный статус...</i>",
+        "stopped": "<emoji document_id=5350342542762209455>😀</emoji> <b>Автообновление остановлено</b>",
+        "_cls_doc": "Показывает статус трека: живой текст из Я.Музыки или инфо из Last.fm",
+    }
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue("yandex_token", None, "OAuth-токен Яндекс.Музыки (для живого текста)"),
+            loader.ConfigValue("api_key", None, "API Key от Last.fm (для других сервисов)"),
+            loader.ConfigValue("api_secret", None, "API Secret от Last.fm", validator=loader.validators.Hidden()),
+            loader.ConfigValue("username", None, "Твой никнейм на Last.fm"),
+        )
+        self.ym_client = None
+        self.bg_task = None
+        self.last_message_text = ""
+        self.last_track_id = None
+        self.current_lyrics_lrc = None
+        self.last_ym_info = None
+
+    async def on_unload(self):
+        if self.bg_task: self.bg_task.cancel()
+
+    async def client_ready(self, client, db):
+        if self.config["yandex_token"]:
+            try:
+                self.ym_client = await yandex_music.ClientAsync(self.config["yandex_token"]).init()
+            except UnauthorizedError: self.ym_client = None
+
+    async def _update_message(self, message, text):
+        if text != self.last_message_text:
+            await utils.answer(message, text)
+            self.last_message_text = text
+
+    @loader.command(aliases=["np", "music"], ru_doc="Запустить/обновить музыкальный статус")
+    async def lfmcmd(self, message):
+        if self.bg_task: self.bg_task.cancel()
+        msg = await utils.answer(message, self.strings("loading"))
+        self.last_message_text = ""
+        self.last_track_id = None
+        self.bg_task = asyncio.create_task(self._master_loop(msg))
+
+    @loader.command(aliases=["npstop", "musicstop"], ru_doc="Остановить музыкальный статус")
+    async def lfmstopcmd(self, message):
+        if self.bg_task:
+            self.bg_task.cancel()
+            self.bg_task = None
+            await utils.answer(message, self.strings("stopped"))
+        else:
+            await utils.answer(message, self.strings("stopped").split(' ')[0] + " Автообновление и так не запущено")
+
+    async def _get_yandex_state(self):
+        if not self.ym_client: return "INACTIVE", None
+        try:
+            ynison = await self._get_ynison(self.config["yandex_token"])
+            player_state = ynison.get("player_state", {})
+            queue = player_state.get("player_queue", {})
+            if not queue.get("playable_list"): return "INACTIVE", None
+            idx = queue.get("current_playable_index", -1)
+            if not (0 <= idx < len(queue["playable_list"])): return "INACTIVE", None
+            
+            track_id = queue["playable_list"][idx]["playable_id"]
+            track_obj = (await self.ym_client.tracks(track_id))[0]
+            track_info = {"id": track_id, "artist": ", ".join(track_obj.artists_name()), "title": track_obj.title}
+            
+            status = player_state.get("status", {})
+            if status.get("paused"): return "PAUSED", track_info
+
+            track_info["progress_ms"] = int(status.get("progress_ms", 0))
+            return "PLAYING", track_info
+        except Exception: return "INACTIVE", None
+
+    async def _get_lastfm_track(self, network):
+        if not network: return None
+        try:
+            user = network.get_user(self.config["username"])
+            current_track = user.get_now_playing()
+            if current_track:
+                return {"artist": current_track.artist.name, "title": current_track.title}
+            return None
+        except Exception: return None
+
+    async def _master_loop(self, message):
+        lfm_network = None
+        if all((self.config["api_key"], self.config["api_secret"], self.config["username"])):
+            try:
+                lfm_network = pylast.LastFMNetwork(api_key=self.config["api_key"], api_secret=self.config["api_secret"])
+            except Exception: pass
+        
+        while True:
+            try:
+                ym_status, ym_track = await self._get_yandex_state()
+                lfm_track = await self._get_lastfm_track(lfm_network)
+
+                # Priority 1: Yandex is actively playing
+                if ym_status == "PLAYING":
+                    await self._handle_yandex_live(message, ym_track)
+                    await asyncio.sleep(2)
+                    continue
+
+                # Priority 2: Last.fm is playing AND it's not a ghost of a paused Yandex track
+                if lfm_track:
+                    is_ghost = (ym_status == "PAUSED" and 
+                                lfm_track["artist"] == ym_track["artist"] and 
+                                lfm_track["title"] == ym_track["title"])
+                    if not is_ghost:
+                        await self._handle_lastfm_track(message, lfm_track)
+                        await asyncio.sleep(10)
+                        continue
+                
+                # Priority 3: Yandex is paused
+                if ym_status == "PAUSED":
+                    await self._update_message(message, self.strings("paused"))
+                else: # Default: Nothing is playing anywhere
+                    await self._update_message(message, self.strings("no_playing"))
+                
+                self.last_track_id = None
+                await asyncio.sleep(15)
+
+            except asyncio.CancelledError: break
+            except Exception: await asyncio.sleep(20)
+        self.bg_task = None
+    
+    async def _handle_yandex_live(self, message, track_info):
+        track_id = track_info["id"]
+        if track_id != self.last_track_id:
+            self.last_track_id = track_id
+            self.current_lyrics_lrc = None
+
+        link = self.strings("ym_link").format(track_id=track_id)
+        if self.current_lyrics_lrc is None:
+            try:
+                lyrics_obj = await self.ym_client.tracks_lyrics(track_id, "LRC")
+                async with aiohttp.ClientSession() as s, s.get(lyrics_obj.download_url) as r:
+                    self.current_lyrics_lrc = await r.text()
+            except (NotFoundError, Exception): self.current_lyrics_lrc = ""
+        
+        if not self.current_lyrics_lrc:
+            await self._handle_lastfm_track(message, track_info) # Fallback to full text
+            return
+
+        current, next_line = "", ""
+        for line in self.current_lyrics_lrc.splitlines():
+            m = re.match(r"\[(\d+):(\d+\.\d+)\](.*)", line.strip())
+            if not m: continue
+            ts = (int(m.groups()[0]) * 60 + float(m.groups()[1])) * 1000
+            txt = m.groups()[2].strip()
+            if not txt: continue
+            if ts <= track_info["progress_ms"]: current = txt
+            elif current and not next_line: next_line = txt; break
+        
+        await self._update_message(message, self.strings("ym_live").format(current=current or "...", next=next_line or "...", **track_info, link=link))
+
+    async def _handle_lastfm_track(self, message, track_info):
+        track_info_str = f"{track_info['artist']} - {track_info['title']}"
+        if self.last_track_id == track_info_str: return
+        self.last_track_id = track_info_str
+
+        track_id, lyrics = None, None
+        if self.ym_client:
+            try:
+                search = await self.ym_client.search(track_info_str, type_="track")
+                if search.tracks and search.tracks.results:
+                    track_id = search.tracks.results[0].id
+                    lyrics_obj = await self.ym_client.tracks_lyrics(track_id)
+                    lyrics = lyrics_obj.fetch_lyrics()
+            except Exception: pass
+        
+        link = self.strings("ym_link").format(track_id=track_id) if track_id else ""
+        if lyrics:
+            text = self.strings("lfm_playing_lyrics").format(**track_info, lyrics=utils.escape_html(lyrics), link=link)
+        else:
+            text = self.strings("lfm_playing").format(**track_info, link=link) + f"\n\n{self.strings('no_lyrics')}"
+        
+        await self._update_message(message, text)
+
+    async def _get_ynison(self, token):
+        # ... [Unchanged from previous version]
+        device_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=32))
+        ws_proto = {"Ynison-Device-Id": device_id, "Ynison-Device-Info": json.dumps({"app_name": "Chrome", "type": 1})}
+        headers = {"Sec-WebSocket-Protocol": f"Bearer, v2, {json.dumps(ws_proto)}", "Origin": "https://music.yandex.ru", "Authorization": f"OAuth {token}"}
+        async with aiohttp.ClientSession() as s:
+            async with s.ws_connect("wss://ynison.music.yandex.ru/redirector.YnisonRedirectService/GetRedirectToYnison", headers=headers) as ws:
+                redirect = json.loads((await ws.receive()).data)
+            ws_proto["Ynison-Redirect-Ticket"] = redirect["redirect_ticket"]
+            payload = {"update_full_state": {"player_state": {"player_queue": {"current_playable_index": -1,"entity_id": "","entity_type": "VARIOUS","playable_list": [],"options": {"repeat_mode": "NONE"},"entity_context": "BASED_ON_ENTITY_BY_DEFAULT","version": {"device_id": device_id, "version": 1, "timestamp_ms": 0}},"status": {"duration_ms": 0,"paused": True,"playback_speed": 1,"progress_ms": 0,"version": {"device_id": device_id, "version": 1, "timestamp_ms": 0}}},"device": {"capabilities": {"can_be_player": True, "can_be_remote_controller": False, "volume_granularity": 16},"info": {"device_id": device_id, "type": "WEB", "title": "Chrome Browser", "app_name": "Chrome"},"volume_info": {"volume": 0},"is_shadow": True},"is_currently_active": False},"rid": "1","player_action_timestamp_ms": 0,"activity_interception_type": "DO_NOT_INTERCEPT_BY_DEFAULT"}
+            headers_with_ticket = {"Sec-WebSocket-Protocol": f"Bearer, v2, {json.dumps(ws_proto)}", "Origin": "https://music.yandex.ru", "Authorization": f"OAuth {token}"}
+            async with s.ws_connect(f"wss://{redirect['host']}/ynison_state.YnisonStateService/PutYnisonState", headers=headers_with_ticket) as ws:
+                await ws.send_str(json.dumps(payload))
+                return json.loads((await ws.receive()).data)
