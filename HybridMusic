@@ -37,10 +37,10 @@ class Lfm(loader.Module):
     strings = {
         "name": "HybridMusic",
         "now_playing": '<emoji document_id=5258500422393415126>🎤</emoji><b>Сейчас играет:</b> <i>{artist} - {title}</i> <b>|</b> <a href="https://music.yandex.ru/track/{id}">Яндекс.Музыка</a>',
+        "now_playing_lfm": '<emoji document_id=5258500422393415126>🎤</emoji><b>Сейчас играет:</b> <i>{artist} - {title}</i> <b>|</b> Last.fm',
         "playlist_info": '<emoji document_id=5301219129192115723>❤️</emoji> <b>Плейлист:</b> <i>{context}</i>',
         "lyrics_block": '<emoji document_id=5258217809250372293>🎥</emoji><b>Текст:</b>\n<blockquote><b>{current}</b>\n<i>{next}</i></blockquote>',
         "no_lyrics_block": '<emoji document_id=5258217809250372293>🎥</emoji><b>Текст:</b> 😔 <i>Текст для этого трека не найден.</i>',
-        "static_lyrics_block": '<emoji document_id=5258217809250372293>🎥</emoji><b>Текст:</b>\n<blockquote expandable>{lyrics}</blockquote>',
         "recent_tracks_block": '<emoji document_id=5258387666616994756>❓</emoji> <b>Последние {count} треков:</b>\n<blockquote expandable>{tracks}</blockquote>',
         
         "no_playing": '<emoji document_id=5409230238062247909>🔝</emoji> <b>Ничего не играет</b>',
@@ -106,7 +106,7 @@ class Lfm(loader.Module):
             loader.ConfigValue("update_interval", 15, "Интервал опроса в неактивном режиме (сек)", validator=loader.validators.Integer(minimum=5)),
             loader.ConfigValue("force_resync", False, "Включить принудительную синхронизацию живого текста?", validator=loader.validators.Boolean()),
             loader.ConfigValue("resync_interval_sec", 30.0, "Интервал принудительной синхронизации (сек)", validator=loader.validators.Float(minimum=0.001, maximum=999999.0)),
-            loader.ConfigValue("show_lyrics", True, "Показывать блок с текстом? (Может вызывать FloodWait)"),
+            loader.ConfigValue("show_lyrics", True, "Показывать блок с текстом? (Может вызывать FloodWait)", validator=loader.validators.Boolean()),
             loader.ConfigValue("show_recent_tracks", True, "Показывать последние треки из Last.fm?", validator=loader.validators.Boolean()),
             loader.ConfigValue("recent_tracks_count", 5, "Сколько последних треков показывать (1-10)", validator=loader.validators.Integer(minimum=1, maximum=10)),
         )
@@ -184,7 +184,7 @@ class Lfm(loader.Module):
     async def _get_yandex_state(self):
         if not self.ym_client: return "INACTIVE", None, None
         
-        for attempt in range(2): # Try twice
+        for attempt in range(2):
             try:
                 ynison = await self._get_ynison(self.config["yandex_token"])
                 player_state = ynison.get("player_state", {})
@@ -198,7 +198,8 @@ class Lfm(loader.Module):
                 track_info = {
                     "id": track_id, 
                     "artist": utils.escape_html(", ".join(track_obj.artists_name())), 
-                    "title": utils.escape_html(track_obj.title)
+                    "title": utils.escape_html(track_obj.title),
+                    "duration_ms": track_obj.duration_ms
                 }
                 
                 status = player_state.get("status", {})
@@ -209,10 +210,20 @@ class Lfm(loader.Module):
             except Exception as e:
                 logger.warning(f"Failed to get Yandex state (attempt {attempt+1}): {e}")
                 if attempt == 0:
-                    await self._init_clients() # Re-init clients and retry
+                    await self._init_clients()
                 continue
         
         return "INACTIVE", None, None
+
+    async def _get_lastfm_track(self):
+        if not self.lfm_network: return None
+        try:
+            user = self.lfm_network.get_user(self.config["username"])
+            current_track = await asyncio.to_thread(user.get_now_playing)
+            if current_track:
+                return {"artist": utils.escape_html(current_track.artist.name), "title": utils.escape_html(current_track.title)}
+            return None
+        except Exception: return None
 
     async def _master_loop(self, message):
         chat_id = utils.get_chat_id(message)
@@ -243,6 +254,18 @@ class Lfm(loader.Module):
                         await asyncio.sleep(2)
                         continue
 
+                    # --- Yandex is not playing, check Last.fm fallback ---
+                    lfm_track = await self._get_lastfm_track()
+                    if lfm_track:
+                        is_ghost = (ym_status == "PAUSED" and ym_track and
+                                    lfm_track["artist"] == ym_track["artist"] and 
+                                    lfm_track["title"] == ym_track["title"])
+                        if not is_ghost:
+                            await self._handle_lastfm_track(message, lfm_track)
+                            await asyncio.sleep(self.config["update_interval"])
+                            continue
+                    
+                    # --- If no fallback, show Yandex status ---
                     last_track_id = None
                     last_track_progress_ms = -1
                     
@@ -276,9 +299,12 @@ class Lfm(loader.Module):
             recent_tracks = await asyncio.to_thread(user.get_recent_tracks, limit=self.config["recent_tracks_count"] + 1)
             
             if exclude_track_info:
+                # Compare case-insensitively
+                exclude_artist = exclude_track_info["artist"].lower()
+                exclude_title = exclude_track_info["title"].lower()
                 recent_tracks = [
                     t for t in recent_tracks 
-                    if not (t.track.artist.name == exclude_track_info["artist"] and t.track.title == exclude_track_info["title"])
+                    if not (t.track.artist.name.lower() == exclude_artist and t.track.title.lower() == exclude_title)
                 ]
 
             track_list = [f"{i+1}. {utils.escape_html(t.track.artist.name)} - {utils.escape_html(t.track.title)}" for i, t in enumerate(recent_tracks[:self.config["recent_tracks_count"]])]
@@ -313,42 +339,73 @@ class Lfm(loader.Module):
             logger.warning(f"Failed to get yandex context: {e}")
         return "Подборка для вас"
 
+    async def _handle_lastfm_track(self, message, track_info):
+        """Handler for tracks coming from Last.fm fallback."""
+        text_parts = []
+        
+        # Try to find the track on Yandex Music to get a link
+        if self.ym_client:
+            try:
+                search = await self.ym_client.search(f"{track_info['artist']} {track_info['title']}", type_="track")
+                if search.tracks and search.tracks.results:
+                    track_id = search.tracks.results[0].id
+                    text_parts.append(self.strings("now_playing").format(id=track_id, **track_info))
+                else:
+                    raise ValueError("Track not found on Yandex Music")
+            except Exception:
+                text_parts.append(self.strings("now_playing_lfm").format(**track_info))
+        else:
+            text_parts.append(self.strings("now_playing_lfm").format(**track_info))
+        
+        if self.config["show_lyrics"]:
+            text_parts.append(self.strings("no_lyrics_block")) # No live lyrics from LFM
+        
+        recent_tracks_block = await self._get_recent_lfm_tracks(track_info)
+        if recent_tracks_block:
+            text_parts.append(recent_tracks_block)
+            
+        await self._update_message(message, "\n".join(text_parts))
+
     async def _handle_yandex_predictive_live(self, message, track_info, queue):
         context_info = await self._get_yandex_context(queue)
         recent_tracks_block = await self._get_recent_lfm_tracks(track_info)
         playlist_info_block = self.strings("playlist_info").format(context=utils.escape_html(context_info))
         playing_now_block = self.strings("now_playing").format(**track_info)
-        lyrics_block = ""
-        
-        if self.config["show_lyrics"]:
-            try:
-                lyrics_obj = await self.ym_client.tracks_lyrics(track_info["id"], "LRC")
-                if not lyrics_obj.download_url: raise NotFoundError
-                async with aiohttp.ClientSession() as s, s.get(lyrics_obj.download_url) as r:
-                    lrc_text = await r.text()
-                
-                lines = [
-                    {"ts": (int(m[0]) * 60 + float(m[1])) * 1000, "txt": m[2].strip()}
-                    for m in re.findall(r"\[(\d+):(\d+\.\d+)\](.*)", lrc_text) if m[2].strip()
-                ]
-                
-                if not lines:
-                    lyrics_block = self.strings("no_lyrics_block")
-                
-            except (NotFoundError, Exception):
-                lyrics_block = self.strings("no_lyrics_block")
         
         text_parts = [playing_now_block, playlist_info_block]
-        if self.config["show_lyrics"] and lyrics_block:
-             text_parts.append(lyrics_block)
-        if recent_tracks_block: text_parts.append(recent_tracks_block)
-        
-        # If we dont have lyrics to process, just show info and exit
-        if not self.config["show_lyrics"] or "lines" not in locals() or not lines:
+
+        if not self.config["show_lyrics"]:
+            if recent_tracks_block:
+                text_parts.append(recent_tracks_block)
             await self._update_message(message, "\n".join(text_parts))
-            await asyncio.sleep(self.config["update_interval"])
+            
+            remaining_ms = track_info.get('duration_ms', 300000) - track_info.get('progress_ms', 0)
+            await asyncio.sleep(max(1, remaining_ms / 1000))
             return
 
+        try:
+            lyrics_obj = await self.ym_client.tracks_lyrics(track_info["id"], "LRC")
+            if not lyrics_obj.download_url: raise NotFoundError
+            async with aiohttp.ClientSession() as s, s.get(lyrics_obj.download_url) as r:
+                lrc_text = await r.text()
+            
+            lines = [
+                {"ts": (int(m[0]) * 60 + float(m[1])) * 1000, "txt": m[2].strip()}
+                for m in re.findall(r"\[(\d+):(\d+\.\d+)\](.*)", lrc_text) if m[2].strip()
+            ]
+            
+            if not lines: raise ValueError("Empty LRC lines")
+
+        except (NotFoundError, ValueError, Exception):
+            lyrics_block = self.strings("no_lyrics_block")
+            text_parts.append(lyrics_block)
+            if recent_tracks_block: text_parts.append(recent_tracks_block)
+            await self._update_message(message, "\n".join(text_parts))
+            
+            remaining_ms = track_info.get('duration_ms', 300000) - track_info.get('progress_ms', 0)
+            await asyncio.sleep(max(1, remaining_ms / 1000))
+            return
+        
         song_duration_ms = lines[-1]['ts']
         initial_progress_ms = track_info.get('progress_ms', 0)
         start_time = time.time()
