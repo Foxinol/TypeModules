@@ -55,7 +55,7 @@ class AIGenMod(loader.Module):
                 validator=loader.validators.Hidden(),
             ),
             loader.ConfigValue(
-                "GEMINI_MODEL", "gemini-1.0-pro",
+                "GEMINI_MODEL", "gemini-2.5-pro",
                 doc=lambda: self.strings("config_gemini_model"),
             ),
         )
