@@ -32,7 +32,7 @@ class AIGenMod(loader.Module):
     strings = {
         "name": "AIGen",
         "config_gemini_api_key": "Твой Gemini API Key",
-        "config_gemini_model": "Модель Gemini для генерации (по умолчанию gemini-2.5-flash)",
+        "config_gemini_model": "Модель Gemini для генерации (по умолчанию gemini-1.0-pro)",
         "no_api_key": "<emoji document_id=5325731399324310531>🚫</emoji> <b>API-ключ для Gemini не установлен.</b>\nПолучи его <a href='https://makersuite.google.com/app/apikey'>здесь</a> и установи командой:\n<code>.config AIGen GEMINI_API_KEY=ваш_ключ</code>",
         "processing_gen": "<emoji document_id=5451433383841105436>🧠</emoji> <b>Думаю над твоей идеей... Ожидай ZIP</b>",
         "processing_fix": "<emoji document_id=5451393667104113334>🔧</emoji> <b>Изучаю код, готовлю правки...</b>",
@@ -55,7 +55,7 @@ class AIGenMod(loader.Module):
                 validator=loader.validators.Hidden(),
             ),
             loader.ConfigValue(
-                "GEMINI_MODEL", "gemini-2.5-flash",
+                "GEMINI_MODEL", "gemini-1.0-pro",
                 doc=lambda: self.strings("config_gemini_model"),
             ),
         )
@@ -103,27 +103,7 @@ class AIGenMod(loader.Module):
         matches = strict_pattern.findall(ai_response)
 
         if not matches:
-            logger.warning("Strict parsing failed. Falling back to heuristic parsing.")
-            generic_pattern = re.compile(r'```(?:\w*\n)?(.*?)```', re.DOTALL)
-            code_blocks = generic_pattern.findall(ai_response)
-            if not code_blocks: return None
-            
-            matches = []
-            used_filenames = set()
-            for i, code in enumerate(code_blocks):
-                code_lower = code.lower().strip()
-                filename = None
-                if 'bot = bot(token=' in code_lower or 'dp = dispatcher(' in code_lower and 'main.py' not in used_filenames:
-                    filename = 'main.py'
-                elif ('pip install' in code_lower or '==' in code_lower) and code_lower.count('\n') < 15 and 'requirements.txt' not in used_filenames:
-                    filename = 'requirements.txt'
-                elif 'token =' in code_lower and len(code_lower.split('\n')) < 5 and 'config.py' not in used_filenames:
-                    filename = 'config.py'
-                else:
-                    filename = f'file_{i+1}.py'
-
-                used_filenames.add(filename)
-                matches.append((filename, code))
+            return None
 
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
@@ -136,12 +116,12 @@ class AIGenMod(loader.Module):
     async def _handle_api_response(self, msg, ai_response):
         if ai_response.startswith("API_ERROR:"):
             error_msg = self.strings("api_error_permission") if "PERMISSION_DENIED" in ai_response else self.strings("api_error").format(ai_response.split(':', 1)[1].strip())
-            await utils.answer(msg, error_msg)
+            await msg.edit(error_msg)
             return None
             
         zip_buffer = await self._parse_and_zip(ai_response)
         if not zip_buffer:
-            await utils.answer(msg, self.strings("parse_error"))
+            await msg.edit(self.strings("parse_error"))
             return None
         
         return zip_buffer
@@ -174,7 +154,7 @@ class AIGenMod(loader.Module):
         reply = await message.get_reply_message()
         fix_request = utils.get_args_raw(message)
 
-        if not reply or not reply.document or not reply.document.mime_type in ["application/zip", "application/x-zip-compressed"]:
+        if not (reply and reply.file and reply.file.name.lower().endswith(".zip")):
             return await utils.answer(message, self.strings("no_reply"))
         if not fix_request: return await utils.answer(message, self.strings("no_prompt"))
 
@@ -192,8 +172,12 @@ class AIGenMod(loader.Module):
                             content = zf.read(filename).decode('utf-8')
                             code_to_fix += f"--- {filename} ---\n```\n{content}\n```\n\n"
                         except (UnicodeDecodeError, KeyError): continue
-        except Exception as e: return await utils.answer(msg, f"<b>Ошибка при чтении архива:</b>\n<code>{e}</code>")
-        if not code_to_fix: return await utils.answer(msg, "<b>Не удалось прочитать файлы в архиве.</b>")
+        except Exception as e:
+            await msg.edit(f"<b>Ошибка при чтении архива:</b>\n<code>{e}</code>")
+            return
+        if not code_to_fix:
+            await msg.edit("<b>Не удалось прочитать файлы в архиве.</b>")
+            return
 
         prompt = self._get_fix_prompt(code_to_fix, fix_request)
         ai_response = await self._call_gemini(prompt)
@@ -220,20 +204,35 @@ class AIGenMod(loader.Module):
         msg = await utils.answer(message, self.strings("processing_raw"))
 
         prompt = ""
-        if reply and reply.document and reply.document.mime_type in ["application/zip", "application/x-zip-compressed"]:
-            # Logic for fixing, similar to proj_fix
+        if reply and reply.file and reply.file.name.lower().endswith(".zip"):
             code_to_fix = ""
-            # ... (omitted for brevity, it's the same zip reading logic as proj_fix) ...
+            try:
+                with io.BytesIO() as file_stream:
+                    await self._client.download_file(reply.document, file_stream)
+                    file_stream.seek(0)
+                    with zipfile.ZipFile(file_stream, 'r') as zf:
+                        for filename in zf.namelist():
+                            if filename.endswith('/') or os.path.basename(filename).startswith('.'): continue
+                            try:
+                                content = zf.read(filename).decode('utf-8')
+                                code_to_fix += f"--- {filename} ---\n```\n{content}\n```\n\n"
+                            except (UnicodeDecodeError, KeyError): continue
+            except Exception as e:
+                await msg.edit(f"<b>Ошибка при чтении архива:</b>\n<code>{e}</code>")
+                return
+            if not code_to_fix:
+                await msg.edit("<b>Не удалось прочитать файлы в архиве.</b>")
+                return
             prompt = self._get_fix_prompt(code_to_fix, args)
         else:
-            # Logic for generation
             prompt = self._get_gen_prompt(args)
         
         ai_response = await self._call_gemini(prompt)
         
         if ai_response.startswith("API_ERROR:"):
             error_msg = self.strings("api_error_permission") if "PERMISSION_DENIED" in ai_response else self.strings("api_error").format(ai_response.split(':', 1)[1].strip())
-            return await utils.answer(msg, error_msg)
+            await msg.edit(error_msg)
+            return
 
         file = io.BytesIO(ai_response.encode('utf-8'))
         file.name = f"raw_response_{int(time.time())}.txt"
