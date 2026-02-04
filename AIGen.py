@@ -16,6 +16,7 @@ import re
 import time
 import zipfile
 import logging
+import asyncio
 
 import google.generativeai as genai
 from google.api_core import exceptions as core_exceptions
@@ -43,6 +44,7 @@ class AIGenMod(loader.Module):
         "no_reply": "☝️ <b>Ответь на сообщение с ZIP-архивом, который нужно исправить.</b>",
         "not_zip": "📎 <b>Это не ZIP-архив.</b>",
         "success": "✅ <b>Твой проект готов, Хозяин.</b>",
+        "explanation_msg": "<b>Комментарии от ИИ:</b>\n{explanation}",
         "success_raw": "📥 <b>Сырой ответ от Gemini.</b>",
         "no_prompt": "❓ <b>А что генерировать-то? Опиши идею.</b>"
     }
@@ -60,6 +62,7 @@ class AIGenMod(loader.Module):
             ),
         )
 
+    # PROMPTS FOR CODE GENERATION
     def _get_gen_prompt(self, idea: str) -> str:
         return (
             "ТЫ — ЭЛИТНЫЙ PYTHON-РАЗРАБОТЧИК. ТВОЯ ЗАДАЧА — ПРЕДОСТАВИТЬ ТОЛЬКО КОД.\n"
@@ -69,7 +72,8 @@ class AIGenMod(loader.Module):
             "2. КАЖДЫЙ ФАЙЛ ДОЛЖЕН НАЧИНАТЬСЯ СТРОГО с маркера: `--- имя_файла.расширение ---` НА ОТДЕЛЬНОЙ СТРОКЕ. Если есть папки, указывай путь: `--- папка/имя_файла.расширение ---`.\n"
             "3. После маркера вставляй ПОЛНЫЙ блок кода в формате ```python ... ```.\n"
             "4. НИКАКИХ СОКРАЩЕНИЙ И КОММЕНТАРИЕВ-ЗАГЛУШЕК.\n"
-            "5. В файлах конфигурации используй заглушки типа 'ВАШ_ТОКЕН_ЗДЕСЬ'.\n\n"
+            "5. В файлах конфигурации используй заглушки типа 'ВАШ_ТОКЕН_ЗДЕСЬ'.\n"
+            "6. Ты ОБЯЗАН создать файл `start.bat` для Windows. Он должен устанавливать зависимости из `requirements.txt` и запускать основной скрипт (например, `main.py`). Добавь `pause` в конце для отладки.\n\n"
             f"ЗАДАЧА:\n{idea}"
         )
 
@@ -86,11 +90,37 @@ class AIGenMod(loader.Module):
             f"ЗАДАЧА:\n{fix_request}"
         )
 
+    # PROMPTS FOR EXPLANATION GENERATION
+    def _get_gen_explanation_prompt(self, idea: str) -> str:
+        return (
+            "Ты — технический писатель и ассистент разработчика. Тебе дали задачу, по которой только что был сгенерирован код, включая `start.bat`.\n"
+            "Твоя цель — написать краткое и понятное пояснение для пользователя.\n\n"
+            "ПРАВИЛА:\n"
+            "1. Напиши краткое описание того, что делает сгенерированный бот.\n"
+            "2. Дай четкие инструкции по установке и запуску: сначала нужно вписать все токены и ID в конфиг-файлы, а потом просто запустить `start.bat`, который всё установит и запустит сам.\n"
+            "3. Если есть важные моменты или советы по использованию, упомяни их.\n"
+            "4. Говори кратко, по делу, используй Markdown для форматирования.\n\n"
+            f"ИСХОДНАЯ ЗАДАЧА:\n{idea}"
+        )
+
+    def _get_fix_explanation_prompt(self, code_to_fix: str, fix_request: str) -> str:
+        return (
+            "Ты — опытный тимлид, который делает ревью кода. Твой коллега-ИИ только что внёс правки в проект по запросу. "
+            "Твоя задача — изучить исходный код, запрос на исправление и написать краткий ченджлог (список изменений).\n\n"
+            "ПРАВИЛА:\n"
+            "1. Опиши, какие ключевые изменения были внесены в код.\n"
+            "2. Объясни, почему эти изменения были сделаны, основываясь на запросе.\n"
+            "3. Если были добавлены новые зависимости или изменены файлы конфигурации, обязательно укажи это.\n"
+            "4. Говори кратко, по делу, как в отчёте. Используй Markdown.\n\n"
+            f"ИСХОДНЫЙ КОД:\n{code_to_fix}\n\n"
+            f"ЗАПРОС НА ИСПРАВЛЕНИЕ:\n{fix_request}"
+        )
+
     async def _call_gemini(self, prompt_text: str):
         genai.configure(api_key=self.config["GEMINI_API_KEY"])
         model = genai.GenerativeModel(self.config["GEMINI_MODEL"])
         try:
-            response = await model.generate_content_async(prompt_text)
+            response = await model.generate_content_async(prompt_text, request_options={"timeout": 600})
             return response.text
         except core_exceptions.PermissionDenied:
             return "API_ERROR:PERMISSION_DENIED"
@@ -99,7 +129,7 @@ class AIGenMod(loader.Module):
             return f"API_ERROR: {e}"
 
     async def _parse_and_zip(self, ai_response: str):
-        strict_pattern = re.compile(r'--- ([\w\._/-]+) ---\s*```(?:\w*\n)?(.*?)```', re.DOTALL)
+        strict_pattern = re.compile(r'--- ([\w\._/-]+) ---\s*```(?:[a-z]*\n)?(.*?)```', re.DOTALL)
         matches = strict_pattern.findall(ai_response)
 
         if not matches:
@@ -108,7 +138,7 @@ class AIGenMod(loader.Module):
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for filename, code in matches:
-                zip_file.writestr(filename.strip(), code.strip())
+                zip_file.writestr(filename.strip(), code.strip().replace('\r\n', '\n'))
         
         zip_buffer.seek(0)
         return zip_buffer
@@ -134,17 +164,31 @@ class AIGenMod(loader.Module):
         if not idea: return await utils.answer(message, self.strings("no_prompt"))
 
         msg = await utils.answer(message, self.strings("processing_gen"))
-        prompt = self._get_gen_prompt(idea)
-        ai_response = await self._call_gemini(prompt)
 
-        zip_buffer = await self._handle_api_response(msg, ai_response)
+        code_prompt = self._get_gen_prompt(idea)
+        explanation_prompt = self._get_gen_explanation_prompt(idea)
+
+        code_task = self._call_gemini(code_prompt)
+        explanation_task = self._call_gemini(explanation_prompt)
+        
+        ai_response_code, ai_explanation = await asyncio.gather(code_task, explanation_task)
+
+        zip_buffer = await self._handle_api_response(msg, ai_response_code)
         if not zip_buffer: return
 
         zip_filename = f"project_{int(time.time())}.zip"
-        await self._client.send_file(
-            message.peer_id, file=zip_buffer, caption=self.strings("success"),
-            force_document=True, attributes=[DocumentAttributeFilename(zip_filename)]
+        
+        file_msg = await self._client.send_file(
+            message.peer_id,
+            file=zip_buffer,
+            caption=self.strings("success"),
+            force_document=True,
+            attributes=[DocumentAttributeFilename(zip_filename)]
         )
+        
+        explanation_text = self.strings("explanation_msg").format(explanation=ai_explanation)
+        await self._client.send_message(message.peer_id, explanation_text, reply_to=file_msg.id)
+
         if msg.out: await msg.delete()
 
     @loader.command(alias="pf")
@@ -179,17 +223,31 @@ class AIGenMod(loader.Module):
             await utils.answer(msg, "<b>Не удалось прочитать файлы в архиве.</b>")
             return
 
-        prompt = self._get_fix_prompt(code_to_fix, fix_request)
-        ai_response = await self._call_gemini(prompt)
+        code_prompt = self._get_fix_prompt(code_to_fix, fix_request)
+        explanation_prompt = self._get_fix_explanation_prompt(code_to_fix, fix_request)
+
+        code_task = self._call_gemini(code_prompt)
+        explanation_task = self._call_gemini(explanation_prompt)
+
+        ai_response_code, ai_explanation = await asyncio.gather(code_task, explanation_task)
         
-        zip_buffer = await self._handle_api_response(msg, ai_response)
+        zip_buffer = await self._handle_api_response(msg, ai_response_code)
         if not zip_buffer: return
 
         zip_filename = f"fixed_project_{int(time.time())}.zip"
-        await self._client.send_file(
-            message.peer_id, file=zip_buffer, caption=self.strings("success"),
-            force_document=True, attributes=[DocumentAttributeFilename(zip_filename)], reply_to=reply.id
+        
+        file_msg = await self._client.send_file(
+            message.peer_id,
+            file=zip_buffer,
+            caption=self.strings("success"),
+            force_document=True,
+            attributes=[DocumentAttributeFilename(zip_filename)],
+            reply_to=reply.id
         )
+
+        explanation_text = self.strings("explanation_msg").format(explanation=ai_explanation)
+        await self._client.send_message(message.peer_id, explanation_text, reply_to=file_msg.id)
+
         if msg.out: await msg.delete()
 
     @loader.command(alias="pr")
@@ -236,5 +294,10 @@ class AIGenMod(loader.Module):
 
         file = io.BytesIO(ai_response.encode('utf-8'))
         file.name = f"raw_response_{int(time.time())}.txt"
-        await self._client.send_file(message.peer_id, file=file, caption=self.strings("success_raw"))
+        
+        await self._client.send_file(
+            message.peer_id,
+            file=file,
+            caption=self.strings("success_raw")
+        )
         if msg.out: await msg.delete()
