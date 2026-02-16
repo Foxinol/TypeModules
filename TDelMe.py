@@ -28,8 +28,8 @@ class TDelMeMod(loader.Module):
     async def client_ready(self, client, db):
         self.db = db
         self.client = client
-        self.autodel_chats = self.db.get("TDelMe", "autodel_chats", {})
-        logger.info("[T:DelMe] Модуль загружен, чаты для автоудаления: %s", self.autodel_chats)
+        self.autodel_chats = self.db.get("T:DelMe", "autodel_chats", {})
+        self.me = await self.client.get_me()
 
     def _parse_time(self, time_str: str) -> int:
         matches = re.findall(r'(\d+)\s*(h|m|s)', time_str.lower())
@@ -43,7 +43,7 @@ class TDelMeMod(loader.Module):
         return total_seconds
 
     async def delmecmd(self, message):
-        """Удаляет все ваши сообщения в чате."""
+        """Удаляет все ваши сообщения в текущем чате."""
         chat_id = utils.get_chat_id(message)
         msgs_to_del = [message.id]
         async for msg in self.client.iter_messages(chat_id, from_user="me"):
@@ -53,14 +53,14 @@ class TDelMeMod(loader.Module):
             await self.client.delete_messages(chat_id, chunk)
 
     async def delmeautocmd(self, message):
-        """Включает/выключает авто-удаление сообщений.\nИспользование: .delmeauto <время> или .delmeauto"""
+        """Вкл/выкл авто-удаление. Используй: .delmeauto <время> | .delmeauto"""
         chat_id = utils.get_chat_id(message)
         args = utils.get_args_raw(message)
 
         if not args:
             if chat_id in self.autodel_chats:
                 del self.autodel_chats[chat_id]
-                self.db.set("TDelMe", "autodel_chats", self.autodel_chats)
+                self.db.set("T:DelMe", "autodel_chats", self.autodel_chats)
                 await utils.answer(message, "<b>[T:DelMe]</b> Авто-удаление в этом чате <u>отключено</u>.")
             else:
                 await utils.answer(message, "<b>[T:DelMe]</b> Авто-удаление уже было отключено.\nДля включения укажи время, например: <code>.delmeauto 5m</code>")
@@ -72,12 +72,11 @@ class TDelMeMod(loader.Module):
             return
 
         self.autodel_chats[chat_id] = delay
-        self.db.set("TDelMe", "autodel_chats", self.autodel_chats)
+        self.db.set("T:DelMe", "autodel_chats", self.autodel_chats)
         await utils.answer(message, f"<b>[T:DelMe]</b> Авто-удаление <u>включено</u> с задержкой <code>{args}</code>.")
-        logger.info("[T:DelMe] Включено автоудаление для чата %d с задержкой %d сек.", chat_id, delay)
     
     async def delmestatuscmd(self, message):
-        """Показывает текущие чаты с автоудалением."""
+        """Показывает статус автоудаления для чатов."""
         if not self.autodel_chats:
             await utils.answer(message, "<b>[T:DelMe]</b> Нет чатов с включенным автоудалением.")
             return
@@ -88,7 +87,7 @@ class TDelMeMod(loader.Module):
         await utils.answer(message, reply)
 
     async def watcher(self, message):
-        if not message or not hasattr(message, "sender_id"):
+        if not hasattr(self, "me") or not message or not hasattr(message, "sender_id"):
             return
 
         if message.text and message.text.startswith(self.get_prefix()):
@@ -96,13 +95,10 @@ class TDelMeMod(loader.Module):
 
         chat_id = utils.get_chat_id(message)
         
-        if chat_id in self.autodel_chats and message.sender_id == self.client.uid:
+        if chat_id in self.autodel_chats and message.sender_id == self.me.id:
             delay = self.autodel_chats[chat_id]
-            logger.warning("[T:DelMe] Обнаружено мое сообщение %d в чате %d. Таймер на %d сек.", message.id, chat_id, delay)
             await asyncio.sleep(delay)
             try:
-                logger.warning("[T:DelMe] Время вышло. Удаляю сообщение %d.", message.id)
                 await message.delete()
-                logger.warning("[T:DelMe] Сообщение %d успешно удалено.", message.id)
-            except Exception as e:
-                logger.error("[T:DelMe] НЕ СМОГ удалить сообщение %d! Ошибка: %s", message.id, e)
+            except Exception:
+                pass
