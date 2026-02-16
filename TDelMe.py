@@ -25,7 +25,6 @@ class TDelMeMod(loader.Module):
     async def client_ready(self, client, db):
         self.db = db
         self.client = client
-        # Теперь храним словарь {chat_id: delay_seconds}
         self.autodel_chats = self.db.get("TDelMe", "autodel_chats", {})
 
     def _parse_time(self, time_str: str) -> int:
