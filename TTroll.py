@@ -20,10 +20,10 @@ logger = logging.getLogger(__name__)
 @loader.tds
 class TTrollMod(loader.Module):
     """
-    Module for advanced trolling.
-    Supports dictionaries, video inserts, and tagged modes.
+    Модуль для продвинутого троллинга.
+    Поддерживает словари, вставки видео и режимы с тегами.
     """
-    
+
     strings = {
         "name": "T:Troll",
     }
@@ -33,41 +33,54 @@ class TTrollMod(loader.Module):
             loader.ConfigValue(
                 "delay",
                 2.0,
-                "Delay between messages (TagTroll) or before reply (GTroll)",
+                "Задержка между сообщениями (TagTroll) или перед ответом (GTroll)",
                 validator=loader.validators.Float()
             ),
             loader.ConfigValue(
                 "dict_url",
                 "https://raw.githubusercontent.com/Foxinol/TypeModules/refs/heads/main/phrases.txt",
-                "URL source for text phrases"
+                "URL-источник фраз"
             ),
             loader.ConfigValue(
                 "video_url",
                 "https://pomf2.lain.la/f/fftxnkzc.mp4",
-                "URL for the video attachment"
+                "URL для видео-вложения"
             ),
             loader.ConfigValue(
                 "video_mode",
                 "Random",
-                "Video attachment mode",
+                "Режим видео-вложения",
                 validator=loader.validators.Choice(["Off", "Random", "Always"])
             ),
         )
-        self.gtroll_targets = set() # {(chat_id, user_id)}
-        self.tagtroll_tasks = {} # {(chat_id, user_id): asyncio.Task}
+        self.gtroll_targets = set()  # {(chat_id, user_id)}
+        self.tagtroll_tasks = {}     # {(chat_id, user_id): asyncio.Task}
         self.phrases = []
+        self.db = None
 
     async def client_ready(self, client, db):
         self.client = client
+        self.db = db
+        cached = self.db.get("T:Troll", "phrases", None)
+        if cached:
+            self.phrases = cached
+        else:
+            await self._load_phrases()
 
-    async def _load_phrases(self):
-        if self.phrases:
+    async def _load_phrases(self, force: bool = False):
+        """
+        Загружает словарь один раз и кэширует его.
+        Повторные вызовы без force не делают новых запросов.
+        """
+        if self.phrases and not force:
             return True
         try:
             url = self.config["dict_url"]
             r = await utils.run_sync(requests.get, url)
             r.raise_for_status()
             self.phrases = [line.strip() for line in r.text.splitlines() if line.strip()]
+            if self.db is not None:
+                self.db.set("T:Troll", "phrases", self.phrases)
             return True
         except Exception as e:
             logger.error(f"Error loading phrases: {e}")
@@ -77,11 +90,11 @@ class TTrollMod(loader.Module):
         args = utils.get_args(message)
         if args and args[0].lower() == "stop":
             return "stop", "stop"
-            
+
         reply = await message.get_reply_message()
         if reply:
             return reply.sender_id, "Target"
-        
+
         if args:
             try:
                 user = await self.client.get_entity(args[0])
@@ -115,17 +128,19 @@ class TTrollMod(loader.Module):
         try:
             while True:
                 if not self.phrases:
+
                     if not await self._load_phrases():
                         await asyncio.sleep(10)
                         continue
-                
+
                 text = random.choice(self.phrases)
                 text = f"<a href='tg://user?id={user_id}'>{text}</a>"
-                
+
                 await self._send_troll_message(chat_id, text)
-                
+
                 delay = self.config["delay"]
-                if delay < 0.1: delay = 0.1
+                if delay < 0.1:
+                    delay = 0.1
                 await asyncio.sleep(delay)
         except asyncio.CancelledError:
             pass
@@ -134,20 +149,23 @@ class TTrollMod(loader.Module):
 
     @loader.command()
     async def gtroll(self, message):
-        """<reply/user/stop> - Toggle reply trolling"""
+        """<реплай/юзер/stop> - Вкл/выкл троллинг ответами в этом чате"""
         await message.delete()
         if not self.phrases:
             await self._load_phrases()
 
         target_id, _ = await self._get_target(message)
-        
+
         if target_id == "stop":
-            self.gtroll_targets.clear()
+            to_remove = [k for k in self.gtroll_targets if k[0] == message.chat_id]
+            for k in to_remove:
+                self.gtroll_targets.discard(k)
             return
 
         if not target_id:
             return
 
+        # Привязка к чату: троллинг работает только там, где был активирован.
         key = (message.chat_id, target_id)
         if key in self.gtroll_targets:
             self.gtroll_targets.remove(key)
@@ -156,7 +174,7 @@ class TTrollMod(loader.Module):
 
     @loader.command()
     async def tagtroll(self, message):
-        """<reply/user/stop> - Toggle periodic tag trolling"""
+        """<реплай/юзер/stop> - Вкл/выкл периодический троллинг с тегами в этом чате"""
         await message.delete()
         if not self.phrases:
             await self._load_phrases()
@@ -164,9 +182,10 @@ class TTrollMod(loader.Module):
         target_id, _ = await self._get_target(message)
 
         if target_id == "stop":
-            for task in self.tagtroll_tasks.values():
-                task.cancel()
-            self.tagtroll_tasks.clear()
+            to_remove = [k for k in self.tagtroll_tasks if k[0] == message.chat_id]
+            for k in to_remove:
+                self.tagtroll_tasks[k].cancel()
+                del self.tagtroll_tasks[k]
             return
 
         if not target_id:
@@ -177,23 +196,25 @@ class TTrollMod(loader.Module):
             self.tagtroll_tasks[key].cancel()
             del self.tagtroll_tasks[key]
         else:
-            self.tagtroll_tasks[key] = asyncio.create_task(self._tagtroll_loop(message.chat_id, target_id))
+            self.tagtroll_tasks[key] = asyncio.create_task(
+                self._tagtroll_loop(message.chat_id, target_id)
+            )
 
     @loader.watcher(only_messages=True)
     async def watcher(self, message):
         if not self.gtroll_targets or message.out:
             return
-            
+
         if not message.sender_id:
             return
-
+            
         key = (message.chat_id, message.sender_id)
         if key not in self.gtroll_targets:
             return
-        
+
         if not self.phrases:
-             if not await self._load_phrases():
-                 return
+            if not await self._load_phrases():
+                return
 
         if self.config["delay"] > 0:
             await asyncio.sleep(self.config["delay"])
